@@ -4,7 +4,7 @@ import os
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import edge_tts
@@ -87,9 +87,16 @@ def render_slide_image(
     font_body = find_bengali_font(40)
     font_footer = find_bengali_font(26)
 
-    badge_text = chapter_label.strip() or f"অধ্যায় {slide_index}/{total_slides}"
-    draw.rounded_rectangle([80, 48, 520, 104], radius=12, fill=(16, 185, 129))
-    draw.text((104, 58), badge_text[:36], font=font_badge, fill=(15, 23, 42))
+    clean_label = re.sub(r"[^\w\s\u0980-\u09FF:/.-]+", "", chapter_label or "").strip()
+    badge_text = clean_label or f"অধ্যায় {slide_index}/{total_slides}"
+    badge_text = badge_text[:34]
+
+    badge_bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
+    badge_w = max(240, (badge_bbox[2] - badge_bbox[0]) + 48)
+    badge_right = min(width - 80, 80 + badge_w)
+
+    draw.rounded_rectangle([80, 48, badge_right, 104], radius=12, fill=(16, 185, 129))
+    draw.text((104, 58), badge_text, font=font_badge, fill=(15, 23, 42))
 
     title_lines = wrap_text(draw, title, font_title, width - 160)[:2]
     y = 130
@@ -291,7 +298,10 @@ def upload_to_github_release(topic_id: str, mp4_path: Path, old_release_id: str 
         "Accept": "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", f"long-{topic_id}-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    safe_tag = re.sub(r"[^A-Za-z0-9._-]+", "-", f"long-{topic_id}-{stamp}")
+    use_prerelease = os.environ.get("RELEASE_PRERELEASE", "false").strip().lower() in ("1", "true", "yes")
+
     rel_res = requests.post(
         f"https://api.github.com/repos/{gh_repo}/releases",
         headers=headers,
@@ -300,7 +310,7 @@ def upload_to_github_release(topic_id: str, mp4_path: Path, old_release_id: str 
             "name": f"Long Video: {topic_id}",
             "body": f"Automated 16:9 Long Video asset for {topic_id}",
             "draft": False,
-            "prerelease": True,
+            "prerelease": use_prerelease,
         },
         timeout=30,
     )
