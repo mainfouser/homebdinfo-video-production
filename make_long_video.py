@@ -1,7 +1,9 @@
 import asyncio
 import json
+import math
 import os
 import re
+import shutil
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -67,73 +69,274 @@ def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.FreeTypeFont
     return lines_out
 
 
-def render_slide_image(
+def draw_broadcast_anchor_avatar(
+    draw: ImageDraw.ImageDraw,
+    cx: int,
+    cy: int,
+    radius: int,
+    slide_index: int,
+) -> None:
+    """Draws a crisp broadcast-style news anchor / correspondent emblem & portrait frame."""
+    # Outer broadcast ring & subtle glow
+    draw.ellipse(
+        [cx - radius - 10, cy - radius - 10, cx + radius + 10, cy + radius + 10],
+        fill=(220, 38, 38),
+    )
+    draw.ellipse(
+        [cx - radius - 4, cy - radius - 4, cx + radius + 4, cy + radius + 4],
+        fill=(248, 250, 252),
+    )
+    draw.ellipse(
+        [cx - radius, cy - radius, cx + radius, cy + radius],
+        fill=(15, 23, 42),
+    )
+
+    # Stylized studio backdrop arcs inside avatar circle
+    draw.arc(
+        [cx - radius + 12, cy - radius + 12, cx + radius - 12, cy + radius - 12],
+        start=180,
+        end=360,
+        fill=(37, 99, 235),
+        width=8,
+    )
+
+    # Shoulders / broadcast blazer
+    shoulder_top = cy + int(radius * 0.28)
+    draw.pieslice(
+        [cx - radius + 14, shoulder_top, cx + radius - 14, cy + radius + 42],
+        start=180,
+        end=360,
+        fill=(30, 58, 138),
+    )
+    # Shirt collar & red/gold broadcast tie accent
+    draw.polygon(
+        [
+            (cx - 18, shoulder_top + 6),
+            (cx + 18, shoulder_top + 6),
+            (cx, shoulder_top + 54),
+        ],
+        fill=(248, 250, 252),
+    )
+    draw.polygon(
+        [
+            (cx - 6, shoulder_top + 14),
+            (cx + 6, shoulder_top + 14),
+            (cx, shoulder_top + 52),
+        ],
+        fill=(220, 38, 38),
+    )
+
+    # Head & subtle expression shift per segment
+    head_r = int(radius * 0.36)
+    head_cy = cy - int(radius * 0.14)
+    draw.ellipse(
+        [cx - head_r, head_cy - head_r, cx + head_r, head_cy + head_r],
+        fill=(241, 194, 155),
+        outline=(251, 191, 36),
+        width=2,
+    )
+    # Hair cap
+    draw.pieslice(
+        [cx - head_r, head_cy - head_r - 4, cx + head_r, head_cy + int(head_r * 0.15)],
+        start=180,
+        end=360,
+        fill=(17, 24, 39),
+    )
+
+    # Eyes & expression variation across segments
+    eye_y = head_cy - 4
+    eye_dx = int(head_r * 0.38)
+    draw.ellipse([cx - eye_dx - 5, eye_y - 4, cx - eye_dx + 5, eye_y + 4], fill=(15, 23, 42))
+    draw.ellipse([cx + eye_dx - 5, eye_y - 4, cx + eye_dx + 5, eye_y + 4], fill=(15, 23, 42))
+
+    # Mouth expression changes slightly by segment index for visual variety
+    mouth_y = head_cy + int(head_r * 0.42)
+    if slide_index % 3 == 1:
+        # Confident reporting smile/open speaking stance
+        draw.arc([cx - 14, mouth_y - 8, cx + 14, mouth_y + 10], start=10, end=170, fill=(153, 27, 27), width=3)
+    elif slide_index % 3 == 2:
+        # Attentive analytical expression
+        draw.line([(cx - 12, mouth_y), (cx + 12, mouth_y)], fill=(153, 27, 27), width=3)
+    else:
+        # Emphasized summary expression
+        draw.ellipse([cx - 8, mouth_y - 5, cx + 8, mouth_y + 6], fill=(153, 27, 27))
+
+    # Live / On-Air pill below avatar
+    badge_w, badge_h = 128, 30
+    bx1 = cx - badge_w // 2
+    by1 = cy + radius - 14
+    draw.rounded_rectangle([bx1, by1, bx1 + badge_w, by1 + badge_h], radius=15, fill=(220, 38, 38))
+    draw.ellipse([bx1 + 12, by1 + 9, bx1 + 24, by1 + 21], fill=(254, 240, 138))
+    font_tag = find_bengali_font(16)
+    draw.text((bx1 + 30, by1 + 5), "LIVE DESK", font=font_tag, fill=(255, 255, 255))
+
+
+def render_tv_report_slide(
     out_path: Path,
     title: str,
     chapter_label: str,
     body_text: str,
     slide_index: int,
     total_slides: int,
+    channel_name: str = "HOMEBD NEWS DESK",
+    avatar_path: str = "",
 ) -> None:
+    """
+    Renders a 1920x1080 broadcast television report frame with:
+    - Top channel masthead, LIVE / SPECIAL REPORT badge, and timestamp bar
+    - Main report headline & analytical brief card
+    - Anchor/correspondent avatar panel on the right
+    - Bottom ticker tape & lower-third chapter banner
+    """
     width, height = 1920, 1080
-    img = Image.new("RGB", (width, height), color=(15, 23, 42))
+    img = Image.new("RGB", (width, height), color=(10, 15, 29))
     draw = ImageDraw.Draw(img)
 
-    draw.rectangle([0, 0, width, 12], fill=(16, 185, 129))
-    draw.rectangle([0, height - 68, width, height], fill=(30, 41, 59))
+    # Subtle broadcast grid / studio background bands
+    draw.rectangle([0, 0, width, 74], fill=(15, 23, 42))
+    draw.rectangle([0, 74, width, 80], fill=(220, 38, 38))
 
-    font_badge = find_bengali_font(28)
-    font_title = find_bengali_font(48)
-    font_body = find_bengali_font(40)
-    font_footer = find_bengali_font(26)
+    # Diagonal studio accent stripe on right side
+    draw.polygon(
+        [(1360, 80), (1920, 80), (1920, 920), (1180, 920)],
+        fill=(17, 27, 52),
+    )
+    draw.line([(1360, 80), (1180, 920)], fill=(30, 64, 175), width=4)
 
-    clean_label = re.sub(r"[^\w\s\u0980-\u09FF:/.-]+", "", chapter_label or "").strip()
-    badge_text = clean_label or f"অধ্যায় {slide_index}/{total_slides}"
-    badge_text = badge_text[:34]
+    font_top_brand = find_bengali_font(26)
+    font_live = find_bengali_font(22)
+    font_headline = find_bengali_font(46)
+    font_chapter = find_bengali_font(26)
+    font_body = find_bengali_font(36)
+    font_ticker = find_bengali_font(24)
+    font_meta = find_bengali_font(20)
 
-    badge_bbox = draw.textbbox((0, 0), badge_text, font=font_badge)
-    badge_w = max(240, (badge_bbox[2] - badge_bbox[0]) + 48)
-    badge_right = min(width - 80, 80 + badge_w)
+    # Top bar left: Channel brand + BREAKING / SPECIAL REPORT badge
+    draw.rounded_rectangle([36, 16, 176, 58], radius=6, fill=(220, 38, 38))
+    draw.text((52, 22), "বিশেষ প্রতিবেদন", font=font_live, fill=(255, 255, 255))
 
-    draw.rounded_rectangle([80, 48, badge_right, 104], radius=12, fill=(16, 185, 129))
-    draw.text((104, 58), badge_text, font=font_badge, fill=(15, 23, 42))
+    clean_channel = (channel_name or "HOMEBD NEWS DESK").strip()[:36]
+    draw.text((196, 20), clean_channel, font=font_top_brand, fill=(248, 250, 252))
 
-    title_lines = wrap_text(draw, title, font_title, width - 160)[:2]
-    y = 130
-    for line in title_lines:
-        draw.text((80, y), line, font=font_title, fill=(248, 250, 252))
-        y += 62
+    # Top bar right: Segment indicator & clock
+    seg_meta = f"পর্ব {slide_index}/{total_slides}  |  {datetime.now().strftime('%d %b %Y • %H:%M')}"
+    draw.text((width - 420, 24), seg_meta, font=font_meta, fill=(148, 163, 184))
 
-    draw.line([(80, y + 10), (width - 80, y + 10)], fill=(51, 65, 85), width=2)
-    y += 42
+    # Left Main Content Area (x: 48 to 1330)
+    # Main Headline Banner
+    headline_lines = wrap_text(draw, title, font_headline, 1240)[:2]
+    hy = 104
+    draw.rounded_rectangle([48, hy, 1330, hy + 136], radius=12, fill=(23, 37, 84), outline=(59, 130, 246), width=2)
+    draw.rectangle([48, hy, 62, hy + 136], fill=(239, 68, 68))
 
-    card_top = y
-    card_bottom = height - 105
+    ty_head = hy + 16 if len(headline_lines) == 2 else hy + 40
+    for hline in headline_lines:
+        draw.text((84, ty_head), hline, font=font_headline, fill=(255, 255, 255))
+        ty_head += 56
+
+    # Analytical Report Body Card
+    card_top = hy + 160
+    card_bottom = 816
     draw.rounded_rectangle(
-        [80, card_top, width - 80, card_bottom],
-        radius=20,
-        fill=(30, 41, 59),
-        outline=(71, 85, 105),
+        [48, card_top, 1330, card_bottom],
+        radius=14,
+        fill=(15, 23, 42),
+        outline=(51, 65, 85),
         width=2,
     )
 
-    body_lines = wrap_text(draw, body_text, font_body, width - 240)
-    max_lines = max(1, (card_bottom - card_top - 80) // 56)
-    display_lines = body_lines[:max_lines]
-    if len(body_lines) > max_lines:
-        display_lines[-1] = display_lines[-1][: max(0, len(display_lines[-1]) - 3)] + "..."
+    # Sub-header inside card
+    draw.rounded_rectangle([72, card_top + 20, 1306, card_top + 68], radius=8, fill=(30, 41, 59))
+    draw.text((92, card_top + 28), "প্রতিবেদনের মূল তথ্য ও বিশ্লেষণ", font=font_chapter, fill=(250, 204, 21))
 
-    ty = card_top + 40
-    for line in display_lines:
-        draw.text((120, ty), line, font=font_body, fill=(226, 232, 240))
-        ty += 56
+    body_lines = wrap_text(draw, body_text, font_body, 1180)
+    max_lines = max(1, (card_bottom - (card_top + 88) - 24) // 50)
+    shown_lines = body_lines[:max_lines]
+    if len(body_lines) > max_lines and shown_lines:
+        shown_lines[-1] = shown_lines[-1][: max(0, len(shown_lines[-1]) - 3)] + "..."
 
-    draw.text(
-        (80, height - 52),
-        f"HomeBDInfo.com  |  স্লাইড {slide_index} / {total_slides}",
-        font=font_footer,
-        fill=(148, 163, 184),
+    by = card_top + 90
+    for bline in shown_lines:
+        draw.text((92, by), bline, font=font_body, fill=(241, 245, 249))
+        by += 50
+
+    # Right Panel: Anchor / Correspondent Avatar & Briefing Box (x: 1365 to 1884)
+    panel_x1, panel_y1, panel_x2, panel_y2 = 1365, 104, 1884, 816
+    draw.rounded_rectangle(
+        [panel_x1, panel_y1, panel_x2, panel_y2],
+        radius=14,
+        fill=(15, 23, 42),
+        outline=(51, 65, 85),
+        width=2,
     )
+
+    avatar_cx = (panel_x1 + panel_x2) // 2
+    avatar_cy = panel_y1 + 235
+    avatar_r = 165
+
+    custom_loaded = False
+    if avatar_path and os.path.exists(avatar_path):
+        try:
+            av_img = Image.open(avatar_path).convert("RGBA")
+            av_size = avatar_r * 2
+            av_img = av_img.resize((av_size, av_size), Image.Resampling.LANCZOS)
+            mask = Image.new("L", (av_size, av_size), 0)
+            ImageDraw.Draw(mask).ellipse([0, 0, av_size, av_size], fill=255)
+            draw.ellipse(
+                [avatar_cx - avatar_r - 8, avatar_cy - avatar_r - 8, avatar_cx + avatar_r + 8, avatar_cy + avatar_r + 8],
+                fill=(220, 38, 38),
+            )
+            img.paste(av_img, (avatar_cx - avatar_r, avatar_cy - avatar_r), mask)
+            custom_loaded = True
+        except Exception as e:
+            log(f"Custom avatar load fallback: {e}")
+
+    if not custom_loaded:
+        draw_broadcast_anchor_avatar(draw, avatar_cx, avatar_cy, avatar_r, slide_index)
+
+    # Presenter / Desk Card under avatar
+    desk_box_top = avatar_cy + avatar_r + 36
+    draw.rounded_rectangle(
+        [panel_x1 + 24, desk_box_top, panel_x2 - 24, panel_y2 - 24],
+        radius=10,
+        fill=(30, 41, 59),
+        outline=(71, 85, 105),
+        width=1,
+    )
+    draw.text((panel_x1 + 42, desk_box_top + 16), "নিউজ ডেস্ক প্রতিনিধি", font=font_chapter, fill=(96, 165, 250))
+
+    clean_label = re.sub(r"[^\w\s\u0980-\u09FF:/.-]+", "", chapter_label or "").strip()
+    chap_display = clean_label or f"অধ্যায় {slide_index}"
+    chap_lines = wrap_text(draw, chap_display, font_ticker, (panel_x2 - panel_x1) - 84)[:3]
+    cy_txt = desk_box_top + 58
+    for cline in chap_lines:
+        draw.text((panel_x1 + 42, cy_txt), cline, font=font_ticker, fill=(248, 250, 252))
+        cy_txt += 36
+
+    # Lower Third Banner (y: 834 to 996)
+    lt_top = 834
+    lt_bottom = 996
+    draw.rectangle([0, lt_top, width, lt_bottom], fill=(15, 23, 42))
+    draw.rectangle([0, lt_top, 360, lt_bottom], fill=(185, 28, 28))
+    draw.polygon([(360, lt_top), (410, lt_top), (370, lt_bottom), (320, lt_bottom)], fill=(250, 204, 21))
+
+    draw.text((28, lt_top + 24), "লোয়ার থার্ড", font=font_meta, fill=(254, 202, 202))
+    lt_title_lines = wrap_text(draw, chap_display, font_headline, 1420)[:2]
+    ly = lt_top + 54 if len(lt_title_lines) == 1 else lt_top + 52
+    for lline in lt_title_lines:
+        draw.text((425, ly), lline, font=font_headline, fill=(255, 255, 255))
+        ly += 52
+
+    # Bottom News Ticker Tape (y: 996 to 1080)
+    ticker_top = 996
+    draw.rectangle([0, ticker_top, width, height], fill=(2, 6, 23))
+    draw.rectangle([0, ticker_top, 230, height], fill=(250, 204, 21))
+    draw.text((24, ticker_top + 26), "ব্রেকিং / আপডেট", font=font_ticker, fill=(15, 23, 42))
+
+    ticker_msg = f"{title}  •  {chap_display}  •  {clean_channel}"
+    ticker_lines = wrap_text(draw, ticker_msg, font_ticker, width - 270)[:1]
+    if ticker_lines:
+        draw.text((250, ticker_top + 26), ticker_lines[0], font=font_ticker, fill=(226, 232, 240))
 
     img.save(out_path, format="PNG")
 
@@ -183,6 +386,60 @@ def split_into_segments(voiceover_script: str, scene_plan_text: str, num_segment
     return segments
 
 
+def render_segment_video_with_motion(
+    seg_png: Path,
+    seg_mp3: Path,
+    seg_mp4: Path,
+    duration_sec: float,
+    slide_index: int,
+) -> None:
+    """
+    Creates a broadcast-style 1920x1080 video clip with subtle Ken Burns zoom/pan motion
+    and a top progress bar so each segment feels like a TV news report rather than a static image.
+    """
+    frames = max(25, int(math.ceil(duration_sec * 25)))
+    # Alternate gentle zoom-in / zoom-out around center
+    if slide_index % 2 == 1:
+        zoom_expr = f"1+0.04*on/{frames}"
+    else:
+        zoom_expr = f"1.04-0.04*on/{frames}"
+
+    vf_chain = (
+        f"scale=2048:1152,"
+        f"zoompan=z='{zoom_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=1920x1080:fps=25,"
+        f"drawbox=x=0:y=74:w=iw*(t/{max(duration_sec, 0.1)}):h=6:color=0xFACC15@0.95:t=fill,"
+        f"format=yuv420p"
+    )
+
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-i",
+        str(seg_png),
+        "-i",
+        str(seg_mp3),
+        "-vf",
+        vf_chain,
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "21",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        str(seg_mp4),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def build_video_from_segments(
     work_dir: Path,
     title: str,
@@ -190,8 +447,13 @@ def build_video_from_segments(
     scene_plan_text: str,
     voice_name: str,
     out_mp4: Path,
+    channel_name: str = "HOMEBD NEWS DESK",
+    avatar_path: str = "",
 ) -> float:
+    if work_dir.exists():
+        shutil.rmtree(work_dir, ignore_errors=True)
     work_dir.mkdir(parents=True, exist_ok=True)
+
     segments = split_into_segments(voiceover_script, scene_plan_text, num_segments=6)
     clip_paths = []
     total_duration = 0.0
@@ -205,40 +467,24 @@ def build_video_from_segments(
         dur = get_audio_duration(seg_mp3)
         total_duration += dur
 
-        render_slide_image(
+        render_tv_report_slide(
             out_path=seg_png,
             title=title,
             chapter_label=label,
             body_text=text,
             slide_index=idx,
             total_slides=len(segments),
+            channel_name=channel_name,
+            avatar_path=avatar_path,
         )
 
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-loop",
-            "1",
-            "-i",
-            str(seg_png),
-            "-i",
-            str(seg_mp3),
-            "-c:v",
-            "libx264",
-            "-tune",
-            "stillimage",
-            "-pix_fmt",
-            "yuv420p",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            str(seg_mp4),
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        render_segment_video_with_motion(
+            seg_png=seg_png,
+            seg_mp3=seg_mp3,
+            seg_mp4=seg_mp4,
+            duration_sec=dur,
+            slide_index=idx,
+        )
         clip_paths.append(seg_mp4)
 
     concat_list = work_dir / "concat.txt"
@@ -307,8 +553,8 @@ def upload_to_github_release(topic_id: str, mp4_path: Path, old_release_id: str 
         headers=headers,
         json={
             "tag_name": safe_tag,
-            "name": f"Long Video: {topic_id}",
-            "body": f"Automated 16:9 Long Video asset for {topic_id}",
+            "name": f"TV Report Long Video: {topic_id}",
+            "body": f"Automated 16:9 TV Report Long Video asset for {topic_id}",
             "draft": False,
             "prerelease": use_prerelease,
         },
@@ -343,7 +589,7 @@ def notify_telegram_with_controls(topic_id: str, title: str, duration_label: str
     if not token or not chat_id:
         return
     text = (
-        "🎬 <b>Long Video (16:9) Ready for Review</b>\n"
+        "📺 <b>TV Report Long Video (16:9) Ready for Review</b>\n"
         f"• <b>Topic ID:</b> <code>{topic_id}</code>\n"
         f"• <b>Title:</b> {title}\n"
         f"• <b>Duration:</b> {duration_label}\n"
@@ -386,6 +632,8 @@ def main() -> None:
     requested_topic = os.environ.get("TOPIC_ID", "").strip()
     max_videos = max(1, int(os.environ.get("MAX_VIDEOS", "1") or "1"))
     voice_name = os.environ.get("VOICE_NAME", "bn-BD-NabanitaNeural").strip() or "bn-BD-NabanitaNeural"
+    channel_name = os.environ.get("CHANNEL_NAME", "HOMEBD NEWS DESK").strip() or "HOMEBD NEWS DESK"
+    avatar_path = os.environ.get("AVATAR_PATH", "assets/anchor_avatar.png").strip()
 
     gc = get_gspread_client()
     sh = gc.open_by_key(spreadsheet_id)
@@ -448,7 +696,7 @@ def main() -> None:
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     for t_id, v_title, voiceover, scene_plan in candidates[:max_videos]:
-        log(f"Rendering 16:9 Long Video for {t_id}: {v_title}")
+        log(f"Rendering 16:9 TV Report Long Video for {t_id}: {v_title}")
         safe_id = re.sub(r"[^A-Za-z0-9_-]+", "_", t_id)
         out_mp4 = Path("output") / f"{safe_id}_long_16x9.mp4"
         work_dir = Path("work") / safe_id
@@ -460,6 +708,8 @@ def main() -> None:
             scene_plan_text=scene_plan,
             voice_name=voice_name,
             out_mp4=out_mp4,
+            channel_name=channel_name,
+            avatar_path=avatar_path,
         )
 
         mins = int(duration_sec // 60)
@@ -477,7 +727,7 @@ def main() -> None:
             dur_label,
             "Auto-Checked",
             "Pending Review",
-            f"Generated 16:9 long video via GitHub Actions ({voice_name}) | Release ID: {release_id}",
+            f"Generated 16:9 TV report video via GitHub Actions ({voice_name}) | Release ID: {release_id}",
             now_str,
             release_id,
             video_url,
