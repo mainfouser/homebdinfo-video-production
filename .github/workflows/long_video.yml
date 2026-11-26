@@ -34,10 +34,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-cjk fonts-noto-extra
 
-      - name: Install Python packages
+      - name: Install Python packages and Playwright Chromium
         run: |
           python -m pip install --upgrade pip
-          pip install edge-tts gspread google-auth Pillow requests
+          pip install edge-tts gspread google-auth Pillow requests playwright
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
 
       - name: Run Long Video Generator
         env:
@@ -48,8 +50,6 @@ jobs:
           VOICE_NAME: ${{ vars.VOICE_NAME || 'bn-BD-NabanitaNeural' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
         run: |
           python make_long_video.py
 
@@ -61,13 +61,11 @@ jobs:
           path: output/*.mp4
           if-no-files-found: ignore
 
-      - name: Send Failure Notification to Telegram & Sheet
+      - name: Send Failure Notification to Telegram
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          APPS_SCRIPT_WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           MSG="🚨 <b>GitHub Actions Video Generation Failed!</b>%0A• <b>Workflow:</b> Generate Long Video (16:9)%0A• <b>Run ID:</b> #${{ github.run_number }}%0A• <b>Link:</b> <a href='${RUN_URL}'>View Failed Job Log</a>"
@@ -75,9 +73,3 @@ jobs:
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "text=${MSG}" \
             -d "parse_mode=HTML"
-
-          if [ -n "$APPS_SCRIPT_WEBHOOK_URL" ]; then
-            curl -s -X POST "$APPS_SCRIPT_WEBHOOK_URL" \
-              -H "Content-Type: application/json" \
-              -d "{\"secret\":\"${WEBHOOK_SECRET}\",\"event\":\"github_error\",\"job\":\"Generate Long Video (16:9)\",\"run_url\":\"${RUN_URL}\",\"topic_id\":\"${{ github.event.inputs.topic_id }}\",\"error\":\"Long video workflow failed on run #${{ github.run_number }}\"}" || true
-          fi
