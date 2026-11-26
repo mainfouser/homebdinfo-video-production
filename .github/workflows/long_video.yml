@@ -18,7 +18,7 @@ permissions:
 jobs:
   build-long-video:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -61,11 +61,13 @@ jobs:
           path: output/*.mp4
           if-no-files-found: ignore
 
-      - name: Send Failure Notification to Telegram
+      - name: Send Failure Notification to Telegram & Sheet
         if: failure()
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          APPS_SCRIPT_WEBHOOK_URL: ${{ secrets.APPS_SCRIPT_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_SECRET }}
         run: |
           RUN_URL="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           MSG="🚨 <b>GitHub Actions Video Generation Failed!</b>%0A• <b>Workflow:</b> Generate Long Video (16:9)%0A• <b>Run ID:</b> #${{ github.run_number }}%0A• <b>Link:</b> <a href='${RUN_URL}'>View Failed Job Log</a>"
@@ -73,3 +75,9 @@ jobs:
             -d "chat_id=${TELEGRAM_CHAT_ID}" \
             -d "text=${MSG}" \
             -d "parse_mode=HTML"
+
+          if [ -n "$APPS_SCRIPT_WEBHOOK_URL" ]; then
+            curl -s -X POST "$APPS_SCRIPT_WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -d "{\"secret\":\"${WEBHOOK_SECRET}\",\"event\":\"github_error\",\"job\":\"Generate Long Video (16:9)\",\"run_url\":\"${RUN_URL}\",\"topic_id\":\"${{ github.event.inputs.topic_id }}\",\"error\":\"Long video workflow failed on run #${{ github.run_number }}\"}" || true
+          fi
