@@ -335,7 +335,7 @@ def col_index_map(headers: list) -> dict:
 
 
 # ---------------------------------------------------------
-# 4. VOICEOVER & PROSODY ENGINE (NO LINKS IN SPEECH)
+# 4. VOICEOVER & PROSODY ENGINE (FIXED BATCH CONCAT)
 # ---------------------------------------------------------
 def _spell_domain_for_tts(domain_str: str) -> str:
     parts = [p.strip() for p in domain_str.strip().split(".") if p.strip()]
@@ -500,6 +500,8 @@ def _ensure_valid_pcm_wav(src_wav: str, dst_wav: str, min_dur: float = 0.15):
 
 
 def _concat_wav_batch(batch_files: List[str], out_wav: str):
+    if not batch_files:
+        return
     if len(batch_files) == 1:
         _ensure_valid_pcm_wav(batch_files[0], out_wav, min_dur=0.20)
         return
