@@ -335,7 +335,7 @@ def col_index_map(headers: list) -> dict:
 
 
 # ---------------------------------------------------------
-# 4. VOICEOVER & PROSODY ENGINE (FIXED BATCH CONCAT)
+# 4. VOICEOVER & PROSODY ENGINE (DEMUXER CONCAT FIX)
 # ---------------------------------------------------------
 def _spell_domain_for_tts(domain_str: str) -> str:
     parts = [p.strip() for p in domain_str.strip().split(".") if p.strip()]
@@ -380,7 +380,7 @@ def clean_voiceover_script(text: str) -> str:
         t,
     )
     t = re.sub(
-        r"\b(?:[a-z0-9-]+\.)+(?:gov\.bd|com\.bd|org\.bd|edu\.bd|bd|com|org|net|info)\b",
+        r"(?:[a-z0-9-]+\.)+(?:gov\.bd|com\.bd|org\.bd|edu\.bd|bd|com|org|net|info)",
         lambda m: _spell_domain_for_tts(m.group(0)),
         t,
         flags=re.IGNORECASE,
@@ -499,35 +499,41 @@ def _ensure_valid_pcm_wav(src_wav: str, dst_wav: str, min_dur: float = 0.15):
         )
 
 
-def _concat_wav_batch(batch_files: List[str], out_wav: str):
-    if not batch_files:
-        return
-    if len(batch_files) == 1:
-        _ensure_valid_pcm_wav(batch_files[0], out_wav, min_dur=0.20)
+def _concat_wav_files_via_list(wav_files: List[str], out_wav: str, work_dir: str):
+    valid_files = [wf for wf in wav_files if wf and os.path.exists(wf) and os.path.getsize(wf) > 44]
+    if not valid_files:
+        _ensure_valid_pcm_wav("", out_wav, min_dur=1.0)
         return
 
-    filter_inputs = []
-    filter_pads = []
-    for i, sf in enumerate(batch_files):
-        filter_inputs.extend(["-i", sf])
-        filter_pads.append(f"[{i}:a]aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo[a{i}]")
+    normalized_files = []
+    for i, vf in enumerate(valid_files):
+        norm_f = os.path.join(work_dir, f"norm_seg_{i}_{int(time.time()*1000)%100000}.wav")
+        _ensure_valid_pcm_wav(vf, norm_f, min_dur=0.15)
+        normalized_files.append(norm_f)
 
-    concat_filter = (
-        "".join(filter_pads)
-        + f"{''.join(f'[a{i}]' for i in range(len(batch_files)))}concat=n={len(batch_files)}:v=0:a=1[aout]"
-    )
+    list_txt = os.path.join(work_dir, f"concat_list_{int(time.time()*1000)%100000}.txt")
+    with open(list_txt, "w", encoding="utf-8") as lf:
+        for nf in normalized_files:
+            abs_nf = os.path.abspath(nf).replace("\\", "/")
+            lf.write(f"file '{abs_nf}'\n")
 
     subprocess.run(
         [
-            "ffmpeg", "-y", "-threads", "2", *filter_inputs,
-            "-filter_complex", concat_filter,
-            "-map", "[aout]",
+            "ffmpeg", "-y", "-threads", "2",
+            "-f", "concat", "-safe", "0", "-i", list_txt,
             "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", out_wav,
         ],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+    for tmp_f in normalized_files + [list_txt]:
+        if tmp_f and os.path.exists(tmp_f):
+            try:
+                os.remove(tmp_f)
+            except Exception:
+                pass
 
 
 def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Dict]]:
@@ -632,15 +638,7 @@ def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Di
     raw_concat_wav = os.path.join(work_dir, "voiceover_raw.wav")
     final_voice_wav = os.path.join(work_dir, "voiceover_full.wav")
 
-    batch_size = 20
-    batch_wavs = []
-    for b_idx in range(0, len(segment_files), batch_size):
-        chunk_files = segment_files[b_idx : b_idx + batch_size]
-        b_out = os.path.join(work_dir, f"batch_voice_{b_idx // batch_size}.wav")
-        _concat_wav_batch(chunk_files, b_out)
-        batch_wavs.append(b_out)
-
-    _concat_wav_batch(batch_wavs, raw_concat_wav)
+    _concat_wav_files_via_list(segment_files, raw_concat_wav, work_dir)
 
     subprocess.run(
         [
@@ -659,7 +657,7 @@ def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Di
         stderr=subprocess.DEVNULL,
     )
 
-    for cleanup_f in segment_files + batch_wavs + [raw_concat_wav]:
+    for cleanup_f in segment_files + [raw_concat_wav]:
         if cleanup_f and os.path.exists(cleanup_f):
             try:
                 os.remove(cleanup_f)
