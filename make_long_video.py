@@ -244,8 +244,7 @@ def send_four_button_approval(
         caption_lines.append(f"🏷 <b>Release:</b> <a href='{tg_escape(release_url)}'>Open GitHub Release</a>")
     caption_lines.append("")
     caption_lines.append("▶️ ডাউনলোড ছাড়াই টেলিগ্রাম প্লেয়ারে ভিডিওটি প্লে করে দেখুন এবং নিচের ৪টি বাটন থেকে একটি বেছে নিন:")
-    caption = "
-".join(caption_lines)
+    caption = "\n".join(caption_lines)
 
     markup = {
         "inline_keyboard": [
@@ -592,9 +591,8 @@ def _concat_wav_files_via_list(wav_files: List[str], out_wav: str, work_dir: str
     list_txt = os.path.join(work_dir, f"concat_list_{int(time.time()*1000)%100000}.txt")
     with open(list_txt, "w", encoding="utf-8") as lf:
         for nf in normalized_files:
-            abs_nf = os.path.abspath(nf).replace("\", "/")
-            lf.write(f"file '{abs_nf}'
-")
+            abs_nf = os.path.abspath(nf).replace("\\", "/")
+            lf.write(f"file '{abs_nf}'\n")
 
     subprocess.run(
         [
@@ -1388,7 +1386,7 @@ def download_relevant_stock_clips(keywords: str, work_dir: str, max_clips: int =
 # 7. SUBTITLE OVERLAY & FINAL 16:9 LONG VIDEO ASSEMBLY
 # ---------------------------------------------------------
 def _escape_concat_path(path_str: str) -> str:
-    abs_p = os.path.abspath(path_str).replace("\", "/")
+    abs_p = os.path.abspath(path_str).replace("\\", "/")
     return abs_p.replace("'", "'\''")
 
 
@@ -1454,12 +1452,9 @@ def build_subtitle_overlay_track(kinetic_segments: List[Dict], voice_dur: float,
     concat_file = os.path.join(sub_dir, "sub_concat.txt")
     with open(concat_file, "w", encoding="utf-8") as f:
         for img_path, dur in valid_entries:
-            f.write(f"file '{_escape_concat_path(img_path)}'
-")
-            f.write(f"duration {dur:.3f}
-")
-        f.write(f"file '{_escape_concat_path(valid_entries[-1][0])}'
-")
+            f.write(f"file '{_escape_concat_path(img_path)}'\n")
+            f.write(f"duration {dur:.3f}\n")
+        f.write(f"file '{_escape_concat_path(valid_entries[-1][0])}'\n")
 
     sub_mov = os.path.join(work_dir, "kinetic_track_16x9.mov")
     try:
