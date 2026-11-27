@@ -236,7 +236,6 @@ def send_four_button_approval(
 
     send_video_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
 
-    # 1) Try direct streaming video upload to Telegram player (up to ~49 MB for standard Bot API)
     if os.path.exists(mp4_path) and size_mb <= 49.0:
         files = {"video": open(mp4_path, "rb")}
         if thumb_path and os.path.exists(thumb_path):
@@ -270,7 +269,6 @@ def send_four_button_approval(
                 except Exception:
                     pass
 
-    # 2) Fallback: if video is larger than 49 MB, try passing the public GitHub release asset URL to sendVideo
     if asset_url:
         try:
             res = requests.post(
@@ -295,7 +293,6 @@ def send_four_button_approval(
         except Exception as exc:
             print(f"Telegram sendVideo URL error: {exc}")
 
-    # 3) Final fallback: send message with links & 4 buttons
     send_telegram_message(caption, reply_markup=markup, disable_preview=False)
 
 
@@ -492,7 +489,7 @@ def _ensure_valid_pcm_wav(src_wav: str, dst_wav: str, min_dur: float = 0.15):
         subprocess.run(
             [
                 "ffmpeg", "-y", "-threads", "2",
-                "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+                "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
                 "-t", f"{min_dur:.2f}",
                 "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", dst_wav,
             ],
@@ -500,6 +497,35 @@ def _ensure_valid_pcm_wav(src_wav: str, dst_wav: str, min_dur: float = 0.15):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+
+def _concat_wav_batch(batch_files: List[str], out_wav: str):
+    if len(batch_files) == 1:
+        _ensure_valid_pcm_wav(batch_files[0], out_wav, min_dur=0.20)
+        return
+
+    filter_inputs = []
+    filter_pads = []
+    for i, sf in enumerate(batch_files):
+        filter_inputs.extend(["-i", sf])
+        filter_pads.append(f"[{i}:a]aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo[a{i}]")
+
+    concat_filter = (
+        "".join(filter_pads)
+        + f"{''.join(f'[a{i}]' for i in range(len(batch_files)))}concat=n={len(batch_files)}:v=0:a=1[aout]"
+    )
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-threads", "2", *filter_inputs,
+            "-filter_complex", concat_filter,
+            "-map", "[aout]",
+            "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", out_wav,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Dict]]:
@@ -604,26 +630,15 @@ def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Di
     raw_concat_wav = os.path.join(work_dir, "voiceover_raw.wav")
     final_voice_wav = os.path.join(work_dir, "voiceover_full.wav")
 
-    # Decode and re-encode PCM streams cleanly instead of raw stream copy (-c copy) to avoid exit code 254
-    filter_inputs = []
-    filter_pads = []
-    for i, sf in enumerate(segment_files):
-        filter_inputs.extend(["-i", sf])
-        filter_pads.append(f"[{i}:a]aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo[a{i}]")
+    batch_size = 20
+    batch_wavs = []
+    for b_idx in range(0, len(segment_files), batch_size):
+        chunk_files = segment_files[b_idx : b_idx + batch_size]
+        b_out = os.path.join(work_dir, f"batch_voice_{b_idx // batch_size}.wav")
+        _concat_wav_batch(chunk_files, b_out)
+        batch_wavs.append(b_out)
 
-    concat_filter = "".join(filter_pads) + f"{''.join(f'[a{i}]' for i in range(len(segment_files)))}concat=n={len(segment_files)}:v=0:a=1[aout]"
-
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-threads", "2", *filter_inputs,
-            "-filter_complex", concat_filter,
-            "-map", "[aout]",
-            "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", raw_concat_wav,
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    _concat_wav_batch(batch_wavs, raw_concat_wav)
 
     subprocess.run(
         [
@@ -642,17 +657,12 @@ def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Di
         stderr=subprocess.DEVNULL,
     )
 
-    for sf in segment_files:
-        if os.path.exists(sf):
+    for cleanup_f in segment_files + batch_wavs + [raw_concat_wav]:
+        if cleanup_f and os.path.exists(cleanup_f):
             try:
-                os.remove(sf)
+                os.remove(cleanup_f)
             except Exception:
                 pass
-    if os.path.exists(raw_concat_wav):
-        try:
-            os.remove(raw_concat_wav)
-        except Exception:
-            pass
 
     return final_voice_wav, kinetic_segments
 
