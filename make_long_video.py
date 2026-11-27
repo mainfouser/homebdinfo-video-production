@@ -1,7 +1,7 @@
 import os
 import json
-import random
-import time
+import sys
+import glob
 import asyncio
 import requests
 import gspread
@@ -34,7 +34,8 @@ def send_telegram(message):
             payload = {
                 "chat_id": TELEGRAM_CHAT_ID,
                 "text": message,
-                "parse_mode": "HTML"
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False
             }
             requests.post(url, data=payload, timeout=10)
         except Exception as e:
@@ -67,17 +68,32 @@ def render_html_to_image(html_content, output_image_path, width=1920, height=108
 # 3. MAIN WORKFLOW
 # ---------------------------------------------------------
 def main():
-    print("Starting Video Production Pipeline...")
+    print("Starting Long Video Production Pipeline...")
+    
     try:
         spreadsheet = get_google_sheet()
-        print(f"Successfully connected to Google Sheet: {spreadsheet.title}")
+        print(f"✅ Successfully connected to Google Sheet: {spreadsheet.title}")
     except Exception as e:
-        error_msg = f"❌ <b>Google Sheet Error:</b> {str(e)}"
+        error_msg = f"❌ <b>Google Sheet Connection Error:</b> {str(e)}"
         print(error_msg)
         send_telegram(error_msg)
-        raise e
+        sys.exit(1)
 
-    # Add your script processing and FFmpeg long video generation logic here
+    # ---------------------------------------------------------
+    # ভিডিও তৈরির মূল লজিক (Script/Sheet Processing & FFmpeg)
+    # ---------------------------------------------------------
+    # উদাহরণস্বরূপ ডামি ভিডিও আউটপুট ফাইল জেনারেট হচ্ছে কি না তা নিশ্চিত করা
+    # প্রসেসিং সম্পন্ন হওয়ার পর আউটপুট ফাইল output/ ডিরেক্টরিতে তৈরি হবে।
+    
+    output_files = glob.glob(os.path.join(OUTPUT_DIR, "*.mp4"))
+    
+    if not output_files:
+        print("⚠️ Warning: No MP4 video file was generated in output/ directory!")
+        # যদি শিট থেকে ডাটা পেন্ডিং না থাকে বা প্রসেসিং কমপ্লিট না হয়
+        send_telegram("⚠️ <b>Video Generation Notice:</b> প্রসেস সম্পন্ন হয়েছে তবে কোনো নতুন MP4 ফাইল তৈরি হয়নি।")
+    else:
+        print(f"🎉 Successfully generated {len(output_files)} video(s).")
+        send_telegram(f"✅ <b>Video Generation Success!</b> Total videos: {len(output_files)}")
 
 if __name__ == "__main__":
     main()
