@@ -1,23 +1,24 @@
 import os
 import re
+import gc
 import sys
 import json
 import math
-import glob
 import time
 import asyncio
+import tempfile
 import subprocess
 from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Tuple
 
 import requests
 import gspread
 from google.oauth2.service_account import Credentials
 import edge_tts
-from PIL import Image, ImageDraw, ImageFont
-from playwright.sync_api import sync_playwright
+from PIL import Image, ImageDraw, ImageFont, ImageFilter
 
 # ---------------------------------------------------------
-# 1. ENVIRONMENT & CONFIGURATION
+# 1. ENVIRONMENT & LONG-VIDEO CONFIGURATION (16:9)
 # ---------------------------------------------------------
 GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
@@ -31,17 +32,55 @@ GITHUB_TOKEN = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or 
 GITHUB_REPOSITORY = (os.environ.get("GITHUB_REPOSITORY") or os.environ.get("GH_REPO") or "").strip()
 GITHUB_RUN_NUMBER = os.environ.get("GITHUB_RUN_NUMBER", "1").strip()
 
+BGM_FILE = "bgm.mp3"
+LOGO_FILE = "logo.png"
+
+BGM_VOICE_VOLUME = 0.13
+BGM_OUTRO_VOLUME = 0.19
+
 VIDEO_WIDTH = 1920
 VIDEO_HEIGHT = 1080
 FPS = 30
+HOOK_DURATION = 5.0
+COVER_DURATION = 0.5
+OUTRO_DURATION = 5.0
+
 OUTPUT_DIR = "output"
-WORK_DIR = "work_long_video"
+WORK_DIR_ROOT = "work_long_video"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(WORK_DIR, exist_ok=True)
+os.makedirs(WORK_DIR_ROOT, exist_ok=True)
+
+BENGALI_FONT_PATHS = [
+    "/usr/share/fonts/truetype/noto/NotoSansBengali-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansBengali-SemiBold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansBengali-Bold.ttf",
+]
+LATIN_FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+]
+
+
+def find_font(paths: List[str], size: int) -> ImageFont.FreeTypeFont:
+    for p in paths:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    for root, _, files in os.walk("/usr/share/fonts"):
+        for f in files:
+            if "Bengali" in f and f.endswith((".ttf", ".otf")):
+                try:
+                    return ImageFont.truetype(os.path.join(root, f), size)
+                except Exception:
+                    pass
+    return ImageFont.load_default()
 
 
 # ---------------------------------------------------------
-# 2. TELEGRAM & GITHUB HELPERS
+# 2. TELEGRAM & GITHUB RELEASE HELPERS
 # ---------------------------------------------------------
 def tg_escape(text: str) -> str:
     return (
@@ -66,7 +105,7 @@ def send_telegram_message(text: str, reply_markup: dict = None, disable_preview:
         }
         if reply_markup:
             payload["reply_markup"] = reply_markup
-        res = requests.post(url, json=payload, timeout=20)
+        res = requests.post(url, json=payload, timeout=25)
         if res.ok:
             return res.json()
         print(f"Telegram sendMessage warning ({res.status_code}): {res.text[:400]}")
@@ -75,11 +114,10 @@ def send_telegram_message(text: str, reply_markup: dict = None, disable_preview:
     return None
 
 
-def upload_release_asset(mp4_path: str, topic_id: str) -> dict:
-    """Upload MP4 to a GitHub Release and return asset URL, release URL, and release ID."""
+def upload_release_asset(mp4_path: str, thumb_path: str, topic_id: str) -> dict:
     file_name = os.path.basename(mp4_path)
     tag_name = f"long-{topic_id}-r{GITHUB_RUN_NUMBER}-{int(time.time())}"
-    release_title = f"Long Video: {topic_id} (Run #{GITHUB_RUN_NUMBER})"
+    release_title = f"HomeBDInfo Long Video: {topic_id} (Run #{GITHUB_RUN_NUMBER})"
 
     if not GITHUB_TOKEN or not GITHUB_REPOSITORY:
         return {
@@ -99,7 +137,7 @@ def upload_release_asset(mp4_path: str, topic_id: str) -> dict:
     payload = {
         "tag_name": tag_name,
         "name": release_title,
-        "body": f"Automated 16:9 long video release for Topic ID {topic_id}.",
+        "body": f"Automated 16:9 long video release for Topic ID {topic_id} • HomeBDInfo.",
         "draft": False,
         "prerelease": False,
     }
@@ -113,27 +151,31 @@ def upload_release_asset(mp4_path: str, topic_id: str) -> dict:
         rel_data = r.json()
         release_id = str(rel_data.get("id", ""))
         release_url = str(rel_data.get("html_url", ""))
-        upload_url_raw = str(rel_data.get("upload_url", ""))
-        upload_url = upload_url_raw.split("{")[0]
+        upload_url = str(rel_data.get("upload_url", "")).split("{")[0]
 
         with open(mp4_path, "rb") as f:
-            up_headers = {
-                "Authorization": f"Bearer {GITHUB_TOKEN}",
-                "Content-Type": "video/mp4",
-            }
             up_res = requests.post(
                 f"{upload_url}?name={requests.utils.quote(file_name)}",
-                headers=up_headers,
+                headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Content-Type": "video/mp4"},
                 data=f,
                 timeout=300,
             )
 
         asset_url = f"https://github.com/{GITHUB_REPOSITORY}/releases/download/{tag_name}/{file_name}"
         if up_res.status_code in (200, 201):
-            up_json = up_res.json()
-            asset_url = str(up_json.get("browser_download_url") or asset_url)
+            asset_url = str(up_res.json().get("browser_download_url") or asset_url)
         else:
             print(f"GitHub asset upload warning ({up_res.status_code}): {up_res.text[:400]}")
+
+        if thumb_path and os.path.exists(thumb_path):
+            thumb_name = os.path.basename(thumb_path)
+            with open(thumb_path, "rb") as tf:
+                requests.post(
+                    f"{upload_url}?name={requests.utils.quote(thumb_name)}",
+                    headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Content-Type": "image/jpeg"},
+                    data=tf,
+                    timeout=90,
+                )
 
         return {
             "tag": tag_name,
@@ -155,20 +197,19 @@ def send_four_button_approval(topic_id: str, title: str, mp4_path: str, release_
     release_url = release_info.get("release_url", "")
 
     lines = [
-        "🎬 <b>নতুন লং ভিডিও তৈরি হয়েছে (অনুমোদন প্রয়োজন)</b>",
+        "🎬 <b>নতুন ১৬:৯ লং ভিডিও তৈরি হয়েছে • HomeBDInfo</b>",
         "",
         f"📌 <b>Topic ID:</b> <code>{tg_escape(topic_id)}</code>",
         f"📝 <b>Title:</b> {tg_escape(title)}",
         f"⏱ <b>Duration:</b> {mins}m {secs}s | <b>Size:</b> {size_mb:.1f} MB",
     ]
     if asset_url:
-        lines.append(f"▶️ <b>Video / Stream Link:</b> <a href='{tg_escape(asset_url)}'>Watch / Download MP4</a>")
+        lines.append(f"▶️ <b>Video File:</b> <a href='{tg_escape(asset_url)}'>Watch / Download MP4</a>")
     if release_url:
-        lines.append(f"📦 <b>GitHub Release:</b> <a href='{tg_escape(release_url)}'>Open Release</a>")
+        lines.append(f"📦 <b>Release:</b> <a href='{tg_escape(release_url)}'>Open Release</a>")
     lines.append("")
     lines.append("নিচের ৪টি বাটন থেকে একটি নির্বাচন করুন:")
 
-    # 4 buttons across clean rows
     markup = {
         "inline_keyboard": [
             [
@@ -181,12 +222,11 @@ def send_four_button_approval(topic_id: str, title: str, mp4_path: str, release_
             ],
         ]
     }
-    # FIXED: Proper newline join for Telegram message
     send_telegram_message("\n".join(lines), reply_markup=markup, disable_preview=False)
 
 
 # ---------------------------------------------------------
-# 3. GOOGLE SHEETS CONNECTION & HELPERS
+# 3. GOOGLE SHEETS HELPERS
 # ---------------------------------------------------------
 def get_google_sheet():
     if not GOOGLE_SERVICE_ACCOUNT_JSON or not SPREADSHEET_ID:
@@ -224,346 +264,1061 @@ def col_index_map(headers: list) -> dict:
 
 
 # ---------------------------------------------------------
-# 4. VOICEOVER SANITIZER & SCENE BUILDER
+# 4. VOICEOVER & PROSODY ENGINE (NO LINKS IN SPEECH)
 # ---------------------------------------------------------
-def sanitize_tts_text(raw_text: str) -> str:
-    """Clean narration text so Edge TTS speaks natural Bengali without symbols or English clutter."""
-    text = str(raw_text or "")
-    text = re.sub(r"```[\s\S]*?```", " ", text)
-    text = re.sub(r"\[[^\]]*\]|\([^\)]*\)|\{[^\}]*\}", " ", text)
-    text = re.sub(r"[🌀-🫿☀-➿︀-️‍]", " ", text)
-    text = re.sub(r"[*_~`#|\^=+<>/]", " ", text)
-    text = re.sub(r"[“”‘’\"']", " ", text)
-    text = re.sub(r"[:;?!]+", "।", text)
-    text = re.sub(r"।+", "।", text)
-
-    replacements = [
-        (r" NID ", "এন আই ডি"),
-        (r" TIN ", "টি আই এন"),
-        (r" e-TIN ", "ই টি আই এন"),
-        (r" OTP ", "ও টি পি"),
-        (r" PDF ", "পি ডি এফ"),
-        (r" SMS ", "এস এম এস"),
-        (r" URL ", "ওয়েব ঠিকানা"),
-        (r" BDT ", "টাকা"),
-        (r" homebdinfo\.com ", "হোম বিডি ইনফো ডট কম"),
-        (r" YouTube ", "ইউটিউব"),
-        (r" Facebook ", "ফেসবুক"),
-        (r" Online ", "অনলাইন"),
-        (r" Portal ", "পোর্টাল"),
-        (r" Server ", "সার্ভার"),
-    ]
-    for pattern, repl in replacements:
-        text = re.sub(pattern, repl, text, flags=re.IGNORECASE)
-
-    text = re.sub(r"[A-Za-z0-9]+", " ", text)
-    text = re.sub(r"\s*।\s*", "। ", text)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+def _spell_domain_for_tts(domain_str: str) -> str:
+    parts = [p.strip() for p in domain_str.strip().split(".") if p.strip()]
+    if not parts:
+        return "হোম বিডি ইনফো"
+    spoken = []
+    for part in parts:
+        low = part.lower()
+        if low in ("www", "http", "https"):
+            continue
+        elif low == "gov":
+            spoken.append("গভ")
+        elif low == "bd":
+            spoken.append("বিডি")
+        elif low == "com":
+            spoken.append("কম")
+        elif low == "org":
+            spoken.append("ওআরজি")
+        elif re.fullmatch(r"[a-z]{1,4}", low):
+            spoken.append(" ".join(list(low)))
+        else:
+            spoken.append(part)
+    return " ডট ".join(spoken) if spoken else "হোম বিডি ইনফো"
 
 
-def split_script_into_chunks(clean_text: str, target_chunks: int = 8) -> list:
-    sentences = [s.strip() for s in re.split(r"(?<=[।.])\s+", clean_text) if len(s.strip()) > 3]
-    if not sentences:
-        sentences = [clean_text.strip() or "বিস্তারিত তথ্য উপস্থাপন করা হচ্ছে।"]
+def clean_voiceover_script(text: str) -> str:
+    t = str(text or "").strip()
+    t = re.sub(r"```[\s\S]*?```", " ", t)
+    t = re.sub(r"\[[^\]]*\]|\{[^\}]*\}", " ", t)
+    t = re.sub(
+        r"হোম\s*বিডি\s*ইনফো\s*(?:ডট\s*কম)?\s*\(?homebdinfo\.com\)?",
+        "হোম বিডি ইনফো",
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"https?://(?:www\.)?homebdinfo\.com\S*", "হোম বিডি ইনফো", t, flags=re.IGNORECASE)
+    t = re.sub(r"(?:www\.)?homebdinfo\.com", "হোম বিডি ইনফো", t, flags=re.IGNORECASE)
 
-    chunks = []
-    per_chunk = max(1, math.ceil(len(sentences) / max(1, target_chunks)))
-    for i in range(0, len(sentences), per_chunk):
-        part = " ".join(sentences[i : i + per_chunk]).strip()
-        if part:
-            chunks.append(part)
+    t = re.sub(
+        r"https?://[A-Za-z0-9\-._~:/?#\[\]@!$&'()*+,;=]+",
+        lambda m: _spell_domain_for_tts(re.sub(r"^https?://", "", m.group(0)).split("/")[0]),
+        t,
+    )
+    t = re.sub(
+        r"\b(?:[a-z0-9-]+\.)+(?:gov\.bd|com\.bd|org\.bd|edu\.bd|bd|com|org|net|info)\b",
+        lambda m: _spell_domain_for_tts(m.group(0)),
+        t,
+        flags=re.IGNORECASE,
+    )
+    t = re.sub(r"[🌀-🫿☀-➿︀-️‍*_~`#|\^=+<>/]", " ", t)
+    t = re.sub(r"\s*[—–-]\s*", ", ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t or "হোম বিডি ইনফো এর বিশেষ তথ্যবহুল আলোচনায় আপনাকে স্বাগতম।"
+
+
+def split_clauses_for_tts(script: str) -> List[Dict]:
+    raw_sentences = [p.strip() for p in re.split(r"(?<=[।!?\.])\s+", script) if p.strip()]
+    if not raw_sentences:
+        raw_sentences = [script]
+
+    clauses = []
+    total_s = len(raw_sentences)
+    for s_idx, sent in enumerate(raw_sentences):
+        sub_parts = [sp.strip() for sp in re.split(r"(?<=[,;:])\s+", sent) if sp.strip()]
+        if not sub_parts:
+            sub_parts = [sent]
+
+        merged = []
+        for sp in sub_parts:
+            if merged and (len(sp) < 16 or len(merged[-1]) < 20):
+                merged[-1] = f"{merged[-1]} {sp}".strip()
+            else:
+                merged.append(sp)
+
+        for c_idx, clause_txt in enumerate(merged):
+            clauses.append(
+                {
+                    "text": clause_txt,
+                    "sent_idx": s_idx,
+                    "total_sents": total_s,
+                    "is_hook": (s_idx == 0 and c_idx == 0),
+                    "is_sentence_end": (c_idx == len(merged) - 1),
+                }
+            )
+    return clauses
+
+
+def get_tv_presenter_prosody(clause_info: Dict) -> Tuple[str, str, float]:
+    txt = clause_info["text"]
+    s_idx = clause_info["sent_idx"]
+    total_s = clause_info["total_sents"]
+    is_hook = clause_info["is_hook"]
+    is_end = clause_info["is_sentence_end"]
+
+    pause = 0.34 if is_end else 0.14
+    if is_hook:
+        return "+4%", "-1Hz", 0.30
+    if "?" in txt or any(w in txt for w in ["কীভাবে", "কেন", "কী", "কত", "কখন", "আদৌ"]):
+        return "+2%", "+1Hz", pause + 0.03
+    if any(w in txt for w in ["সতর্ক", "জরুরি", "অবশ্যই", "মনে রাখবেন", "ভুল", "জরিমানা", "আইন", "নিষেধ", "বাতিল"]):
+        return "-1%", "-2Hz", pause + 0.04
+    if s_idx >= max(1, total_s - 1) and is_end:
+        return "-1%", "-2Hz", 0.38
+
+    pat = (s_idx + (0 if is_end else 1)) % 3
+    if pat == 0:
+        return "+1%", "-1Hz", pause
+    elif pat == 1:
+        return "+0%", "-2Hz", pause
+    else:
+        return "+2%", "-1Hz", pause
+
+
+async def _synthesize_phrase(text: str, out_path: str, rate: str, pitch: str, voice: str = VOICE_NAME):
+    comm = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch)
+    await comm.save(out_path)
+
+
+def split_kinetic_chunks(sentence: str, max_chars: int = 52) -> List[str]:
+    words = sentence.split()
+    chunks, cur, cur_len = [], [], 0
+    for w in words:
+        if cur and cur_len + len(w) + 1 > max_chars:
+            chunks.append(" ".join(cur))
+            cur = [w]
+            cur_len = len(w)
+        else:
+            cur.append(w)
+            cur_len += len(w) + (1 if cur_len > 0 else 0)
+    if cur:
+        chunks.append(" ".join(cur))
+    if len(chunks) >= 2 and len(chunks[-1]) <= 6:
+        chunks[-2] = f"{chunks[-2]} {chunks[-1]}".strip()
+        chunks.pop()
     return chunks
 
 
+def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Dict]]:
+    cleaned = clean_voiceover_script(script)
+    clauses = split_clauses_for_tts(cleaned)
+
+    segment_files = []
+    kinetic_segments = []
+    current_time = 0.0
+
+    for idx, c_info in enumerate(clauses):
+        clause_text = c_info["text"]
+        rate, pitch, end_pause = get_tv_presenter_prosody(c_info)
+
+        raw_mp3 = os.path.join(work_dir, f"tts_{idx}.mp3")
+        wav_seg = os.path.join(work_dir, f"tts_{idx}.wav")
+
+        asyncio.run(_synthesize_phrase(clause_text, raw_mp3, rate, pitch, voice=VOICE_NAME))
+
+        subprocess.run(
+            ["ffmpeg", "-y", "-threads", "2", "-i", raw_mp3, "-ar", "44100", "-ac", "2", wav_seg],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if os.path.exists(raw_mp3):
+            os.remove(raw_mp3)
+
+        probe = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", wav_seg,
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        dur = float(probe.stdout.strip())
+        segment_files.append(wav_seg)
+
+        clause_start = current_time
+        current_time += dur
+
+        chunks = split_kinetic_chunks(clause_text, max_chars=52)
+        total_chars = sum(len(c) for c in chunks) or 1
+        t_cursor = clause_start
+        for c_i, ch in enumerate(chunks):
+            ch_dur = dur * (len(ch) / total_chars)
+            kinetic_segments.append(
+                {
+                    "text": ch,
+                    "start": t_cursor,
+                    "end": t_cursor + ch_dur + (end_pause if c_i == len(chunks) - 1 else 0.0),
+                    "is_hook": (c_info["is_hook"] and c_i == 0),
+                }
+            )
+            t_cursor += ch_dur
+
+        if end_pause > 0:
+            sil_wav = os.path.join(work_dir, f"sil_{idx}.wav")
+            subprocess.run(
+                [
+                    "ffmpeg", "-y", "-threads", "2", "-f", "lavfi",
+                    "-i", "anullsrc=r=44100:cl=stereo", "-t", f"{end_pause:.2f}", sil_wav,
+                ],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            segment_files.append(sil_wav)
+            current_time += end_pause
+
+    concat_list = os.path.join(work_dir, "audio_concat.txt")
+    with open(concat_list, "w", encoding="utf-8") as f:
+        for sf in segment_files:
+            f.write(f"file '{sf}'\n")
+
+    raw_concat_wav = os.path.join(work_dir, "voiceover_raw.wav")
+    final_voice_wav = os.path.join(work_dir, "voiceover_full.wav")
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-threads", "2", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", raw_concat_wav],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-threads", "2", "-i", raw_concat_wav,
+            "-af", (
+                "highpass=f=85,"
+                "equalizer=f=165:t=q:w=1.1:g=2.2,"
+                "equalizer=f=3400:t=q:w=1.4:g=2.4,"
+                "acompressor=threshold=-17dB:ratio=2.6:attack=6:release=110,"
+                "loudnorm=I=-15.0:TP=-1.5:LRA=10"
+            ),
+            "-ar", "44100", "-ac", "2", final_voice_wav,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    for sf in segment_files:
+        if os.path.exists(sf):
+            os.remove(sf)
+    if os.path.exists(raw_concat_wav):
+        os.remove(raw_concat_wav)
+
+    return final_voice_wav, kinetic_segments
+
+
 # ---------------------------------------------------------
-# 5. AUDIO, VISUAL RENDERING & FFMPEG ASSEMBLY
+# 5. TYPOGRAPHY, WATERMARK, HOOK, THUMBNAIL & OUTRO (1920x1080)
 # ---------------------------------------------------------
-async def synthesize_edge_tts(text: str, mp3_path: str, voice: str = VOICE_NAME):
-    comm = edge_tts.Communicate(text, voice)
-    await comm.save(mp3_path)
-
-
-def generate_audio_sync(text: str, mp3_path: str, voice: str = VOICE_NAME):
-    asyncio.run(synthesize_edge_tts(text, mp3_path, voice))
-
-
-def get_media_duration(file_path: str) -> float:
-    cmd = [
-        "ffprobe",
-        "-v",
-        "error",
-        "-show_entries",
-        "format=duration",
-        "-of",
-        "default=noprint_wrappers=1:nokey=1",
-        file_path,
-    ]
-    out = subprocess.check_output(cmd, text=True).strip()
-    return max(1.0, float(out))
-
-
-def find_bengali_font() -> str:
-    candidates = [
-        "/usr/share/fonts/opentype/noto/NotoSansBengali-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansBengali-Regular.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSerifBengali-Regular.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    found = glob.glob("/usr/share/fonts/**/*Bengali*.ttf", recursive=True)
-    return found[0] if found else ""
-
-
-def render_scene_frame_playwright(
-    title: str,
-    scene_num: int,
-    total_scenes: int,
-    caption_text: str,
-    lower_third: str,
-    png_path: str,
+def render_mixed_text_line(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    text: str,
+    bn_font: ImageFont.FreeTypeFont,
+    en_font: ImageFont.FreeTypeFont,
+    fill=(255, 255, 255, 255),
+    stroke_width: int = 0,
+    stroke_fill=(0, 0, 0, 255),
 ):
-    safe_title = tg_escape(title)
-    safe_caption = tg_escape(caption_text[:340])
-    safe_lt = tg_escape(lower_third[:140])
+    tokens = re.findall(r"[A-Za-z0-9\./:\-_@|•]+|[^A-Za-z0-9\./:\-_@|•]+", text)
+    cursor_x = x
+    for tok in tokens:
+        is_latin = bool(re.match(r"^[A-Za-z0-9\./:\-_@|•]+$", tok))
+        fnt = en_font if is_latin else bn_font
+        draw.text((cursor_x, y), tok, font=fnt, fill=fill, stroke_width=stroke_width, stroke_fill=stroke_fill)
+        bbox = draw.textbbox((0, 0), tok, font=fnt)
+        cursor_x += bbox[2] - bbox[0]
 
-    html = f"""<!DOCTYPE html>
-<html lang="bn">
-<head>
-<meta charset="UTF-8">
-<style>
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{
-    width: {VIDEO_WIDTH}px;
-    height: {VIDEO_HEIGHT}px;
-    background: linear-gradient(135deg, #071326 0%, #0f294a 55%, #163a63 100%);
-    font-family: "Noto Sans Bengali", "DejaVu Sans", sans-serif;
-    color: #f8fafc;
-    overflow: hidden;
-    position: relative;
-  }}
-  .topbar {{
-    position: absolute;
-    top: 36px;
-    left: 56px;
-    right: 56px;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-  }}
-  .badge {{
-    background: #dc2626;
-    color: #ffffff;
-    font-weight: 700;
-    font-size: 24px;
-    padding: 10px 24px;
-    border-radius: 8px;
-    letter-spacing: 0.5px;
-  }}
-  .brand {{
-    background: rgba(255, 255, 255, 0.12);
-    border: 1px solid rgba(255, 255, 255, 0.25);
-    padding: 10px 22px;
-    border-radius: 8px;
-    font-size: 22px;
-    color: #e2e8f0;
-  }}
-  .main-card {{
-    position: absolute;
-    top: 145px;
-    left: 56px;
-    right: 56px;
-    bottom: 215px;
-    background: rgba(15, 23, 42, 0.72);
-    border: 1px solid rgba(148, 163, 184, 0.25);
-    border-radius: 22px;
-    padding: 46px 54px;
-    display: flex;
-    flex-direction: column;
-    justify-content: center;
-  }}
-  .headline {{
-    font-size: 44px;
-    line-height: 1.35;
-    font-weight: 700;
-    color: #38bdf8;
-    margin-bottom: 26px;
-  }}
-  .narration {{
-    font-size: 34px;
-    line-height: 1.55;
-    color: #f1f5f9;
-  }}
-  .lower-third {{
-    position: absolute;
-    left: 0;
-    right: 0;
-    bottom: 52px;
-    height: 112px;
-    background: linear-gradient(90deg, #991b1b 0%, #dc2626 38%, #0f172a 100%);
-    display: flex;
-    align-items: center;
-    padding: 0 56px;
-    justify-content: space-between;
-    border-top: 3px solid #facc15;
-  }}
-  .lt-text {{
-    font-size: 30px;
-    font-weight: 700;
-    color: #ffffff;
-  }}
-  .lt-scene {{
-    font-size: 24px;
-    color: #fde047;
-    font-weight: 700;
-  }}
-  .watermark {{
-    position: absolute;
-    right: 58px;
-    top: 104px;
-    font-size: 20px;
-    color: rgba(255, 255, 255, 0.35);
-  }}
-</style>
-</head>
-<body>
-  <div class="topbar">
-    <div class="badge">বিশেষ প্রতিবেদন • ১৬:৯</div>
-    <div class="brand">HomeBDInfo.com</div>
-  </div>
-  <div class="watermark">homebdinfo.com</div>
-  <div class="main-card">
-    <div class="headline">{safe_title}</div>
-    <div class="narration">{safe_caption}</div>
-  </div>
-  <div class="lower-third">
-    <div class="lt-text">{safe_lt}</div>
-    <div class="lt-scene">পর্ব {scene_num}/{total_scenes}</div>
-  </div>
-</body>
-</html>"""
 
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page(viewport={"width": VIDEO_WIDTH, "height": VIDEO_HEIGHT})
-            page.set_content(html, wait_until="load")
-            page.screenshot(path=png_path)
-            browser.close()
-        if os.path.exists(png_path):
-            return
-    except Exception as exc:
-        print(f"Playwright render fallback to PIL: {exc}")
+def measure_mixed_text_width(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    bn_font: ImageFont.FreeTypeFont,
+    en_font: ImageFont.FreeTypeFont,
+) -> int:
+    tokens = re.findall(r"[A-Za-z0-9\./:\-_@|•]+|[^A-Za-z0-9\./:\-_@|•]+", text)
+    total_w = 0
+    for tok in tokens:
+        is_latin = bool(re.match(r"^[A-Za-z0-9\./:\-_@|•]+$", tok))
+        fnt = en_font if is_latin else bn_font
+        bbox = draw.textbbox((0, 0), tok, font=fnt)
+        total_w += bbox[2] - bbox[0]
+    return total_w
 
-    # Reliable PIL fallback
-    img = Image.new("RGB", (VIDEO_WIDTH, VIDEO_HEIGHT), (12, 31, 58))
+
+def wrap_text_by_pixel(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    bn_font: ImageFont.FreeTypeFont,
+    en_font: ImageFont.FreeTypeFont,
+    max_width: int,
+) -> List[str]:
+    words = text.split()
+    lines, cur = [], []
+    for w in words:
+        test = " ".join(cur + [w])
+        if cur and measure_mixed_text_width(draw, test, bn_font, en_font) > max_width:
+            lines.append(" ".join(cur))
+            cur = [w]
+        else:
+            cur.append(w)
+    if cur:
+        lines.append(" ".join(cur))
+    return lines
+
+
+def _build_cinematic_backdrop_16x9(seed_clip: Optional[str], work_dir: str) -> Image.Image:
+    if seed_clip and os.path.exists(seed_clip):
+        frame_png = os.path.join(work_dir, f"bg_seed_{int(time.time()*1000)}.png")
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-threads", "2", "-i", seed_clip, "-ss", "00:00:01.0", "-vframes", "1", frame_png],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            if os.path.exists(frame_png):
+                raw = Image.open(frame_png).convert("RGB")
+                bg = raw.resize((VIDEO_WIDTH, VIDEO_HEIGHT), Image.Resampling.LANCZOS)
+                bg = bg.filter(ImageFilter.GaussianBlur(radius=14))
+                os.remove(frame_png)
+                return bg.convert("RGBA")
+        except Exception:
+            pass
+
+    top_rgb = (6, 18, 34)
+    bot_rgb = (14, 42, 68)
+    bg = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (*top_rgb, 255))
+    draw = ImageDraw.Draw(bg)
+    for y in range(0, VIDEO_HEIGHT, 4):
+        p = y / VIDEO_HEIGHT
+        r = int(top_rgb[0] + (bot_rgb[0] - top_rgb[0]) * p)
+        g = int(top_rgb[1] + (bot_rgb[1] - top_rgb[1]) * p)
+        b = int(top_rgb[2] + (bot_rgb[2] - top_rgb[2]) * p)
+        draw.rectangle([0, y, VIDEO_WIDTH, y + 4], fill=(r, g, b, 255))
+    for gx in range(0, VIDEO_WIDTH, 120):
+        draw.line([(gx, 0), (gx, VIDEO_HEIGHT)], fill=(255, 255, 255, 10), width=1)
+    for gy in range(0, VIDEO_HEIGHT, 120):
+        draw.line([(0, gy), (VIDEO_WIDTH, gy)], fill=(255, 255, 255, 10), width=1)
+    return bg
+
+
+def create_minimal_watermark_png(out_path: str):
+    w, h = 420, 74
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    font_path = find_bengali_font()
-    f_big = ImageFont.truetype(font_path, 42) if font_path else ImageFont.load_default()
-    f_med = ImageFont.truetype(font_path, 30) if font_path else ImageFont.load_default()
-    draw.rectangle([40, 40, VIDEO_WIDTH - 40, VIDEO_HEIGHT - 40], outline=(56, 189, 248), width=3)
-    draw.text((80, 110), title[:80], fill=(56, 189, 248), font=f_big)
-    draw.text((80, 220), caption_text[:220], fill=(241, 245, 249), font=f_med)
-    draw.rectangle([0, VIDEO_HEIGHT - 130, VIDEO_WIDTH, VIDEO_HEIGHT - 30], fill=(185, 28, 28))
-    draw.text((70, VIDEO_HEIGHT - 96), f"পর্ব {scene_num}/{total_scenes}: {lower_third[:70]}", fill=(255, 255, 255), font=f_med)
-    img.save(png_path)
+    draw.rounded_rectangle(
+        [4, 5, w - 4, h - 5],
+        radius=34,
+        fill=(8, 22, 36, 220),
+        outline=(250, 204, 21, 210),
+        width=2,
+    )
+    text_x = 22
+    if os.path.exists(LOGO_FILE):
+        try:
+            logo = Image.open(LOGO_FILE).convert("RGBA")
+            lw = 48
+            lh = int(logo.height * (lw / logo.width))
+            logo = logo.resize((lw, lh), Image.Resampling.LANCZOS)
+            draw.ellipse([12, 11, 64, 63], fill=(255, 255, 255, 245))
+            img.paste(logo, (14, (h - lh) // 2), logo)
+            text_x = 76
+        except Exception:
+            pass
+    bn_font = find_font(BENGALI_FONT_PATHS, 26)
+    en_font = find_font(LATIN_FONT_PATHS, 26)
+    render_mixed_text_line(draw, text_x, 20, "HomeBDInfo • বিশেষ ডেস্ক", bn_font, en_font, fill=(255, 255, 255, 252))
+    img.save(out_path, "PNG")
 
 
-def build_long_video_mp4(topic_id: str, title: str, voiceover_script: str, scene_plan_text: str, out_mp4: str) -> float:
-    clean_script = sanitize_tts_text(voiceover_script)
-    scene_lines = [ln.strip() for ln in str(scene_plan_text or "").splitlines() if ln.strip()]
-    target_scenes = max(6, min(10, len(scene_lines) if scene_lines else 8))
-    chunks = split_script_into_chunks(clean_script, target_chunks=target_scenes)
+def create_clean_subtitle_png(text: str, is_hook: bool, out_path: str):
+    canvas_w = 1760
+    canvas_h = 190
+    img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
 
-    segment_mp4s = []
-    total_duration = 0.0
+    font_size = 42 if is_hook else 36
+    if len(text) > 54:
+        font_size = 32
 
-    for idx, chunk_text in enumerate(chunks, start=1):
-        seg_dir = os.path.join(WORK_DIR, f"{topic_id}_s{idx}")
-        os.makedirs(seg_dir, exist_ok=True)
-        audio_path = os.path.join(seg_dir, "voice.mp3")
-        img_path = os.path.join(seg_dir, "frame.png")
-        seg_mp4 = os.path.join(seg_dir, "segment.mp4")
+    bn_font = find_font(BENGALI_FONT_PATHS, font_size)
+    en_font = find_font(LATIN_FONT_PATHS, font_size - 2)
+    lines = wrap_text_by_pixel(draw, text, bn_font, en_font, 1580)[:2]
 
-        generate_audio_sync(chunk_text, audio_path, VOICE_NAME)
-        dur = get_media_duration(audio_path)
-        total_duration += dur
+    line_h = font_size + 14
+    total_h = len(lines) * line_h
+    start_y = (canvas_h - total_h) // 2
+    max_line_w = max((measure_mixed_text_width(draw, ln, bn_font, en_font) for ln in lines), default=500)
+    pad_x, pad_y = 40, 14
 
-        lt = scene_lines[idx - 1] if idx - 1 < len(scene_lines) else title
-        render_scene_frame_playwright(
-            title=title,
-            scene_num=idx,
-            total_scenes=len(chunks),
-            caption_text=chunk_text,
-            lower_third=lt,
-            png_path=img_path,
+    box_x0 = max(24, (canvas_w - max_line_w) // 2 - pad_x)
+    box_x1 = min(canvas_w - 24, (canvas_w + max_line_w) // 2 + pad_x)
+    box_y0 = max(8, start_y - pad_y)
+    box_y1 = min(canvas_h - 8, start_y + total_h + pad_y - 4)
+
+    border_col = (250, 204, 21, 235) if is_hook else (255, 255, 255, 130)
+    draw.rounded_rectangle(
+        [box_x0, box_y0, box_x1, box_y1],
+        radius=22,
+        fill=(7, 18, 30, 228),
+        outline=border_col,
+        width=3 if is_hook else 2,
+    )
+
+    for i, ln in enumerate(lines):
+        lw = measure_mixed_text_width(draw, ln, bn_font, en_font)
+        lx = (canvas_w - lw) // 2
+        ly = start_y + i * line_h
+        txt_fill = (250, 204, 21, 255) if (is_hook or i == 1) else (255, 255, 255, 255)
+        render_mixed_text_line(
+            draw, lx, ly, ln, bn_font, en_font,
+            fill=txt_fill, stroke_width=3, stroke_fill=(0, 0, 0, 255)
         )
 
-        # Gentle Ken Burns zoom/pan on 1920x1080 frame with AAC audio
-        zoom_expr = "min(zoom+0.0004,1.08)" if idx % 2 == 1 else "if(eq(on,1),1.06,max(zoom-0.0004,1.0))"
-        vf = (
-            f"scale=1920:1080,zoompan=z='{zoom_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
-            f"d={max(1, int(math.ceil(dur * FPS)))}:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS},format=yuv420p"
+    img.save(out_path, "PNG")
+
+
+def create_hook_banner_clip(
+    title: str,
+    hook_line: str,
+    seed_clip: Optional[str],
+    out_mp4: str,
+    work_dir: str,
+    duration: float = HOOK_DURATION,
+):
+    bg = _build_cinematic_backdrop_16x9(seed_clip, work_dir)
+    scrim = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (6, 17, 30, 175))
+    base = Image.alpha_composite(bg, scrim)
+    draw = ImageDraw.Draw(base)
+
+    badge_w, badge_h = 460, 56
+    bx0 = (VIDEO_WIDTH - badge_w) // 2
+    by0 = 140
+    draw.rounded_rectangle([bx0, by0, bx0 + badge_w, by0 + badge_h], radius=28, fill=(250, 204, 21, 255))
+    bn_b = find_font(BENGALI_FONT_PATHS, 26)
+    en_b = find_font(LATIN_FONT_PATHS, 25)
+    b_txt = "স্পেশাল ফিচার • HOMEBDINFO"
+    bw = measure_mixed_text_width(draw, b_txt, bn_b, en_b)
+    render_mixed_text_line(draw, (VIDEO_WIDTH - bw) // 2, by0 + 12, b_txt, bn_b, en_b, fill=(7, 18, 30, 255))
+
+    clean_title = re.sub(r"#\w+|https?://\S+", "", title).strip()
+    bn_t = find_font(BENGALI_FONT_PATHS, 56)
+    en_t = find_font(LATIN_FONT_PATHS, 52)
+    t_lines = wrap_text_by_pixel(draw, clean_title, bn_t, en_t, VIDEO_WIDTH - 320)[:2]
+
+    clean_hook = re.sub(r"[•✔*#]+|https?://\S+", "", hook_line).strip()
+    bn_h = find_font(BENGALI_FONT_PATHS, 36)
+    en_h = find_font(LATIN_FONT_PATHS, 34)
+    h_lines = wrap_text_by_pixel(draw, clean_hook, bn_h, en_h, VIDEO_WIDTH - 340)[:2]
+
+    card_w = 1520
+    card_h = 60 + len(t_lines) * 76 + 34 + len(h_lines) * 50 + 54
+    card_x0 = (VIDEO_WIDTH - card_w) // 2
+    card_y0 = 230
+    card_x1 = card_x0 + card_w
+    card_y1 = card_y0 + card_h
+
+    draw.rounded_rectangle(
+        [card_x0, card_y0, card_x1, card_y1],
+        radius=32,
+        fill=(9, 24, 38, 244),
+        outline=(250, 204, 21, 225),
+        width=3,
+    )
+
+    cur_y = card_y0 + 46
+    for i, ln in enumerate(t_lines):
+        lw = measure_mixed_text_width(draw, ln, bn_t, en_t)
+        col = (250, 204, 21, 255) if i == 0 else (255, 255, 255, 255)
+        render_mixed_text_line(draw, (VIDEO_WIDTH - lw) // 2, cur_y, ln, bn_t, en_t, fill=col)
+        cur_y += 76
+
+    draw.line([(card_x0 + 110, cur_y + 8), (card_x1 - 110, cur_y + 8)], fill=(250, 204, 21, 115), width=2)
+    cur_y += 32
+
+    for hl in h_lines:
+        hw = measure_mixed_text_width(draw, hl, bn_h, en_h)
+        render_mixed_text_line(draw, (VIDEO_WIDTH - hw) // 2, cur_y, hl, bn_h, en_h, fill=(226, 232, 240, 255))
+        cur_y += 50
+
+    hook_png = os.path.join(work_dir, "hook_card_16x9.png")
+    base.convert("RGB").save(hook_png, "PNG")
+    del bg, scrim, base, draw
+    gc.collect()
+
+    n_frames = max(1, int(round(duration * FPS)))
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-threads", "2", "-loop", "1", "-i", hook_png,
+            "-vf", (
+                f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT},"
+                f"zoompan=z='1+0.025*(on/{max(1, n_frames)})':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2'"
+                f":d={n_frames}:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
+            ),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-t", f"{duration:.2f}", out_mp4,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    if os.path.exists(hook_png):
+        os.remove(hook_png)
+    gc.collect()
+
+
+def create_thumbnail_jpg(
+    title: str,
+    visual_clips: List[str],
+    out_jpg: str,
+    work_dir: str,
+):
+    seed_clip = visual_clips[0] if visual_clips else None
+    canvas = _build_cinematic_backdrop_16x9(seed_clip, work_dir)
+    overlay = Image.new("RGBA", (VIDEO_WIDTH, VIDEO_HEIGHT), (6, 18, 32, 165))
+    canvas = Image.alpha_composite(canvas, overlay)
+    draw = ImageDraw.Draw(canvas)
+
+    if os.path.exists(LOGO_FILE):
+        try:
+            logo = Image.open(LOGO_FILE).convert("RGBA")
+            lw = 130
+            lh = int(logo.height * (lw / logo.width))
+            logo = logo.resize((lw, lh), Image.Resampling.LANCZOS)
+            draw.ellipse([76, 56, 76 + lw + 24, 56 + lh + 24], fill=(255, 255, 255, 248))
+            canvas.paste(logo, (88, 68), logo)
+        except Exception:
+            pass
+
+    pill_w, pill_h = 370, 52
+    px0 = VIDEO_WIDTH - pill_w - 72
+    py0 = 86
+    draw.rounded_rectangle([px0, py0, px0 + pill_w, py0 + pill_h], radius=26, fill=(250, 204, 21, 255))
+    bn_p = find_font(BENGALI_FONT_PATHS, 25)
+    en_p = find_font(LATIN_FONT_PATHS, 24)
+    p_txt = "HOMEBDINFO • গাইড"
+    pw = measure_mixed_text_width(draw, p_txt, bn_p, en_p)
+    render_mixed_text_line(draw, px0 + (pill_w - pw) // 2, py0 + 11, p_txt, bn_p, en_p, fill=(7, 18, 30, 255))
+
+    clean_title = re.sub(r"#\w+|https?://\S+", "", title).strip()
+    bn_t = find_font(BENGALI_FONT_PATHS, 66)
+    en_t = find_font(LATIN_FONT_PATHS, 60)
+    lines = wrap_text_by_pixel(draw, clean_title, bn_t, en_t, VIDEO_WIDTH - 240)[:3]
+
+    line_h = 92
+    box_pad_y = 42
+    box_h = len(lines) * line_h + box_pad_y * 2
+    box_y0 = max(250, (VIDEO_HEIGHT - box_h) // 2)
+    box_y1 = box_y0 + box_h
+
+    draw.rounded_rectangle(
+        [72, box_y0, VIDEO_WIDTH - 72, box_y1],
+        radius=34,
+        fill=(9, 25, 40, 238),
+        outline=(250, 204, 21, 235),
+        width=4,
+    )
+
+    for idx, ln in enumerate(lines):
+        lw = measure_mixed_text_width(draw, ln, bn_t, en_t)
+        lx = (VIDEO_WIDTH - lw) // 2
+        ly = box_y0 + box_pad_y + idx * line_h
+        col = (250, 204, 21, 255) if idx % 2 == 0 else (255, 255, 255, 255)
+        render_mixed_text_line(draw, lx, ly, ln, bn_t, en_t, fill=col, stroke_width=2, stroke_fill=(0, 0, 0, 255))
+
+    canvas.convert("RGB").save(out_jpg, "JPEG", quality=93)
+    del canvas, overlay
+    gc.collect()
+
+
+def _smooth_ease_out(x: float) -> float:
+    x = max(0.0, min(1.0, x))
+    return 1.0 - ((1.0 - x) ** 3)
+
+
+def build_animated_outro_clip(out_mp4: str, work_dir: str, duration: float = OUTRO_DURATION):
+    frames_dir = os.path.join(work_dir, "outro_frames")
+    os.makedirs(frames_dir, exist_ok=True)
+    n_frames = max(1, int(round(duration * FPS)))
+
+    logo_src = None
+    if os.path.exists(LOGO_FILE):
+        try:
+            logo_src = Image.open(LOGO_FILE).convert("RGBA")
+        except Exception:
+            logo_src = None
+
+    bn_tag = find_font(BENGALI_FONT_PATHS, 26)
+    en_tag = find_font(LATIN_FONT_PATHS, 24)
+    bn_h1 = find_font(BENGALI_FONT_PATHS, 52)
+    en_h1 = find_font(LATIN_FONT_PATHS, 48)
+    bn_sub = find_font(BENGALI_FONT_PATHS, 36)
+    en_sub = find_font(LATIN_FONT_PATHS, 34)
+    bn_brand = find_font(BENGALI_FONT_PATHS, 44)
+    en_brand = find_font(LATIN_FONT_PATHS, 42)
+
+    backdrop_base = _build_cinematic_backdrop_16x9(None, work_dir)
+    bdraw = ImageDraw.Draw(backdrop_base)
+    bdraw.rectangle([0, 0, VIDEO_WIDTH, 8], fill=(250, 204, 21, 235))
+    bdraw.rectangle([0, VIDEO_HEIGHT - 8, VIDEO_WIDTH, VIDEO_HEIGHT], fill=(250, 204, 21, 235))
+
+    for f_idx in range(n_frames):
+        t = f_idx / FPS
+        ease_h1 = _smooth_ease_out(min(1.0, t / 0.45))
+        ease_sub = _smooth_ease_out(max(0.0, min(1.0, (t - 0.25) / 0.45)))
+        ease_dom = _smooth_ease_out(max(0.0, min(1.0, (t - 0.45) / 0.45)))
+
+        img = backdrop_base.copy()
+        draw = ImageDraw.Draw(img)
+
+        card_x0, card_y0 = 180, 170
+        card_x1, card_y1 = VIDEO_WIDTH - 180, VIDEO_HEIGHT - 160
+        draw.rounded_rectangle(
+            [card_x0, card_y0, card_x1, card_y1],
+            radius=36,
+            fill=(10, 27, 44, 242),
+            outline=(250, 204, 21, 180),
+            width=3,
         )
-        cmd = [
-            "ffmpeg",
-            "-y",
-            "-loop",
-            "1",
-            "-i",
-            img_path,
-            "-i",
-            audio_path,
-            "-vf",
-            vf,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "128k",
-            "-shortest",
-            "-movflags",
-            "+faststart",
-            seg_mp4,
-        ]
-        subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        segment_mp4s.append(seg_mp4)
 
-    list_file = os.path.join(WORK_DIR, f"{topic_id}_concat.txt")
-    with open(list_file, "w", encoding="utf-8") as f:
-        for seg in segment_mp4s:
-            abs_seg = os.path.abspath(seg).replace("'", "'\\''")
-            f.write(f"file '{abs_seg}'\n")
+        pill_w, pill_h = 420, 50
+        px0 = (VIDEO_WIDTH - pill_w) // 2
+        py0 = card_y0 + 38
+        draw.rounded_rectangle([px0, py0, px0 + pill_w, py0 + pill_h], radius=25, fill=(17, 47, 74, 240), outline=(250, 204, 21, 200), width=2)
+        tag_txt = "HOMEBDINFO • ডিজিটাল ডেস্ক"
+        tw = measure_mixed_text_width(draw, tag_txt, bn_tag, en_tag)
+        render_mixed_text_line(draw, (VIDEO_WIDTH - tw) // 2, py0 + 10, tag_txt, bn_tag, en_tag, fill=(250, 204, 21, 255))
 
-    concat_cmd = [
-        "ffmpeg",
-        "-y",
-        "-f",
-        "concat",
-        "-safe",
-        "0",
-        "-i",
-        list_file,
-        "-c",
-        "copy",
-        "-movflags",
-        "+faststart",
-        out_mp4,
+        ring_cx, ring_cy = VIDEO_WIDTH // 2, card_y0 + 185
+        draw.ellipse([ring_cx - 76, ring_cy - 76, ring_cx + 76, ring_cy + 76], outline=(250, 204, 21, 225), width=3)
+        draw.ellipse([ring_cx - 64, ring_cy - 64, ring_cx + 64, ring_cy + 64], fill=(255, 255, 255, 252))
+        if logo_src is not None:
+            lw = 96
+            lh = int(logo_src.height * (lw / logo_src.width))
+            rlogo = logo_src.resize((lw, lh), Image.Resampling.LANCZOS)
+            img.paste(rlogo, (ring_cx - lw // 2, ring_cy - lh // 2), rlogo)
+
+        h1 = "নিয়মিত সঠিক ও নির্ভুল তথ্য পেতে"
+        w1 = measure_mixed_text_width(draw, h1, bn_h1, en_h1)
+        h1_y = int(ring_cy + 98 + (1.0 - ease_h1) * 16)
+        render_mixed_text_line(draw, (VIDEO_WIDTH - w1) // 2, h1_y, h1, bn_h1, en_h1, fill=(255, 255, 255, 255))
+
+        h2 = "লাইক, কমেন্ট, শেয়ার ও সাবস্ক্রাইব করুন"
+        w2 = measure_mixed_text_width(draw, h2, bn_sub, en_sub)
+        h2_y = int(h1_y + 74 + (1.0 - ease_sub) * 14)
+        render_mixed_text_line(draw, (VIDEO_WIDTH - w2) // 2, h2_y, h2, bn_sub, en_sub, fill=(250, 204, 21, 255))
+
+        bw, bh = 580, 82
+        bscale = 0.96 + 0.04 * ease_dom
+        cbw, cbh = int(bw * bscale), int(bh * bscale)
+        bx0 = (VIDEO_WIDTH - cbw) // 2
+        by0 = int(h2_y + 76 + (1.0 - ease_dom) * 14 + (bh - cbh) // 2)
+        draw.rounded_rectangle([bx0, by0, bx0 + cbw, by0 + cbh], radius=22, fill=(250, 204, 21, 255))
+
+        b_label = "HomeBDInfo"
+        blw = measure_mixed_text_width(draw, b_label, bn_brand, en_brand)
+        render_mixed_text_line(draw, (VIDEO_WIDTH - blw) // 2, by0 + 16, b_label, bn_brand, en_brand, fill=(7, 18, 30, 255))
+
+        frame_path = os.path.join(frames_dir, f"outro_{f_idx:04d}.png")
+        img.convert("RGB").save(frame_path, "PNG")
+        del img, draw
+
+    if logo_src is not None:
+        logo_src.close()
+    backdrop_base.close()
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-threads", "2",
+            "-framerate", str(FPS),
+            "-i", os.path.join(frames_dir, "outro_%04d.png"),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-pix_fmt", "yuv420p", "-t", f"{duration:.2f}", out_mp4,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    for fn in os.listdir(frames_dir):
+        fp = os.path.join(frames_dir, fn)
+        if os.path.exists(fp):
+            os.remove(fp)
+    if os.path.exists(frames_dir):
+        os.rmdir(frames_dir)
+    gc.collect()
+
+
+# ---------------------------------------------------------
+# 6. CINEMATIC MOTION GRAPHICS & STOCK FOOTAGE (1920x1080)
+# ---------------------------------------------------------
+def _encode_lightweight_motion_clip_16x9(image_path: str, out_mp4: str, duration: int = 10):
+    n_frames = max(1, int(round(duration * FPS)))
+    zoom_expr = f"1+0.05*(on/{max(1, n_frames)})"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-threads", "2", "-loop", "1", "-i", image_path,
+            "-vf", (
+                f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT},"
+                f"zoompan=z='{zoom_expr}':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2'"
+                f":d={n_frames}:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
+            ),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+            "-t", str(duration), out_mp4,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def create_dynamic_topic_graphic_clip(
+    headline: str,
+    bullet_points: List[str],
+    work_dir: str,
+    clip_idx: int,
+    duration: int = 10,
+) -> Optional[str]:
+    try:
+        card_png = os.path.join(work_dir, f"motion_card_16x9_{clip_idx}.png")
+        clip_mp4 = os.path.join(work_dir, f"motion_card_16x9_{clip_idx}.mp4")
+
+        img = _build_cinematic_backdrop_16x9(None, work_dir)
+        draw = ImageDraw.Draw(img)
+
+        badge_w, badge_h = 440, 54
+        bx0 = (VIDEO_WIDTH - badge_w) // 2
+        by0 = 120
+        draw.rounded_rectangle([bx0, by0, bx0 + badge_w, by0 + badge_h], radius=27, fill=(250, 204, 21, 255))
+        bn_b = find_font(BENGALI_FONT_PATHS, 26)
+        en_b = find_font(LATIN_FONT_PATHS, 24)
+        b_txt = f"গুরুত্বপূর্ণ পয়েন্ট • পর্ব ০{clip_idx + 1}"
+        bw = measure_mixed_text_width(draw, b_txt, bn_b, en_b)
+        render_mixed_text_line(draw, (VIDEO_WIDTH - bw) // 2, by0 + 11, b_txt, bn_b, en_b, fill=(7, 18, 30, 255))
+
+        card_x0, card_y0 = 150, 205
+        card_x1, card_y1 = VIDEO_WIDTH - 150, VIDEO_HEIGHT - 195
+        draw.rounded_rectangle(
+            [card_x0, card_y0, card_x1, card_y1],
+            radius=34,
+            fill=(10, 27, 44, 242),
+            outline=(250, 204, 21, 210),
+            width=3,
+        )
+
+        clean_head = re.sub(r"#\w+|https?://\S+", "", headline).strip()
+        bn_h = find_font(BENGALI_FONT_PATHS, 46)
+        en_h = find_font(LATIN_FONT_PATHS, 42)
+        h_lines = wrap_text_by_pixel(draw, clean_head, bn_h, en_h, card_x1 - card_x0 - 120)[:2]
+
+        cur_y = card_y0 + 38
+        for hl in h_lines:
+            hw = measure_mixed_text_width(draw, hl, bn_h, en_h)
+            render_mixed_text_line(draw, (VIDEO_WIDTH - hw) // 2, cur_y, hl, bn_h, en_h, fill=(250, 204, 21, 255))
+            cur_y += 62
+
+        draw.line([(card_x0 + 80, cur_y + 10), (card_x1 - 80, cur_y + 10)], fill=(255, 255, 255, 65), width=2)
+        cur_y += 34
+
+        bn_pt = find_font(BENGALI_FONT_PATHS, 34)
+        en_pt = find_font(LATIN_FONT_PATHS, 32)
+        valid_pts = [re.sub(r"https?://\S+", "", p).strip() for p in bullet_points if len(p.strip()) > 6][:3]
+        for pt in valid_pts:
+            if cur_y > card_y1 - 85:
+                break
+            pt_lines = wrap_text_by_pixel(draw, f"▸ {pt}", bn_pt, en_pt, card_x1 - card_x0 - 130)[:2]
+            for pl in pt_lines:
+                render_mixed_text_line(draw, card_x0 + 65, cur_y, pl, bn_pt, en_pt, fill=(241, 245, 249, 255))
+                cur_y += 46
+            cur_y += 12
+
+        img.convert("RGB").save(card_png, "PNG")
+        del img, draw
+        gc.collect()
+
+        _encode_lightweight_motion_clip_16x9(card_png, clip_mp4, duration=duration)
+        if os.path.exists(card_png):
+            os.remove(card_png)
+        gc.collect()
+        return clip_mp4
+    except Exception:
+        return None
+
+
+def download_relevant_stock_clips(keywords: str, work_dir: str, max_clips: int = 5) -> List[str]:
+    if max_clips <= 0:
+        return []
+    api_key = os.environ.get("PIXABAY_API_KEY", "").strip()
+    if not api_key:
+        return []
+    kw_list = [k.strip() for k in keywords.split(",") if k.strip()]
+    if not kw_list:
+        kw_list = ["office work", "digital technology", "document review", "modern city"]
+
+    banned_tags = {
+        "animal", "monkey", "baboon", "ape", "fire", "flame", "wildfire",
+        "dog", "cat", "bird", "insect", "spider", "snake", "skull", "blood"
+    }
+    downloaded = []
+    seen_ids = set()
+
+    for kw in kw_list[:6]:
+        if len(downloaded) >= max_clips:
+            break
+        try:
+            url = (
+                f"https://pixabay.com/api/videos/?key={api_key}"
+                f"&q={requests.utils.quote(kw)}&order=relevant&per_page=6&safesearch=true"
+            )
+            resp = requests.get(url, timeout=20).json()
+            hits = resp.get("hits", [])
+            for hit in hits:
+                if len(downloaded) >= max_clips:
+                    break
+                vid_id = hit.get("id")
+                if vid_id in seen_ids:
+                    continue
+                tags_str = str(hit.get("tags", "")).lower()
+                if any(b in tags_str for b in banned_tags):
+                    continue
+                videos = hit.get("videos", {})
+                vid_info = videos.get("large") or videos.get("medium") or videos.get("small")
+                if vid_info and vid_info.get("url"):
+                    raw_p = os.path.join(work_dir, f"raw_stock_16x9_{len(downloaded)}.mp4")
+                    norm_p = os.path.join(work_dir, f"norm_stock_16x9_{len(downloaded)}.mp4")
+                    v_data = requests.get(vid_info["url"], timeout=45).content
+                    with open(raw_p, "wb") as f:
+                        f.write(v_data)
+                    del v_data
+
+                    subprocess.run(
+                        [
+                            "ffmpeg", "-y", "-threads", "2", "-i", raw_p,
+                            "-vf", (
+                                f"scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=increase,"
+                                f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},"
+                                f"eq=brightness=-0.08:contrast=1.08:saturation=1.05"
+                            ),
+                            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-r", str(FPS),
+                            "-t", "10", norm_p,
+                        ],
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    if os.path.exists(raw_p):
+                        os.remove(raw_p)
+                    downloaded.append(norm_p)
+                    seen_ids.add(vid_id)
+                    gc.collect()
+        except Exception:
+            continue
+    return downloaded
+
+
+# ---------------------------------------------------------
+# 7. SUBTITLE OVERLAY & FINAL 16:9 LONG VIDEO ASSEMBLY
+# ---------------------------------------------------------
+def build_subtitle_overlay_track(kinetic_segments: List[Dict], voice_dur: float, work_dir: str) -> str:
+    sub_dir = os.path.join(work_dir, "sub_frames_16x9")
+    os.makedirs(sub_dir, exist_ok=True)
+    blank_png = os.path.join(sub_dir, "blank.png")
+    Image.new("RGBA", (1760, 190), (0, 0, 0, 0)).save(blank_png, "PNG")
+
+    seg_pngs = []
+    for idx, seg in enumerate(kinetic_segments):
+        kp = os.path.join(sub_dir, f"sub_{idx}.png")
+        create_clean_subtitle_png(seg["text"], seg["is_hook"], kp)
+        seg_pngs.append((kp, seg["start"], min(seg["end"], voice_dur)))
+
+    concat_file = os.path.join(sub_dir, "sub_concat.txt")
+    cursor = 0.0
+    entries = []
+    for kp, st, en in seg_pngs:
+        if st >= voice_dur or en <= st:
+            continue
+        if st > cursor + 0.02:
+            entries.append((blank_png, st - cursor))
+        entries.append((kp, en - st))
+        cursor = en
+    if cursor < voice_dur:
+        entries.append((blank_png, voice_dur - cursor))
+    if not entries:
+        entries.append((blank_png, voice_dur))
+
+    with open(concat_file, "w", encoding="utf-8") as f:
+        for img_path, dur in entries:
+            f.write(f"file '{img_path}'\n")
+            f.write(f"duration {dur:.3f}\n")
+        f.write(f"file '{entries[-1][0]}'\n")
+
+    sub_mov = os.path.join(work_dir, "kinetic_track_16x9.mov")
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-threads", "2", "-f", "concat", "-safe", "0", "-i", concat_file,
+            "-vf", "fps=15", "-c:v", "png", sub_mov,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    gc.collect()
+    return sub_mov
+
+
+def build_final_long_video(
+    title: str,
+    voice_wav: str,
+    kinetic_segments: List[Dict],
+    visual_clips: List[str],
+    thumbnail_jpg: str,
+    output_mp4: str,
+    work_dir: str,
+) -> float:
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", voice_wav,
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    voice_dur = max(2.0, float(probe.stdout.strip()))
+    total_duration = voice_dur + OUTRO_DURATION
+
+    seed_clip = visual_clips[0] if visual_clips else None
+    hook_line = kinetic_segments[0]["text"] if kinetic_segments else title
+    hook_mp4 = os.path.join(work_dir, "hook_banner_16x9.mp4")
+    create_hook_banner_clip(title, hook_line, seed_clip, hook_mp4, work_dir, duration=min(HOOK_DURATION, voice_dur))
+
+    watermark_png = os.path.join(work_dir, "watermark_pill_16x9.png")
+    outro_mp4 = os.path.join(work_dir, "outro_animated_16x9.mp4")
+    create_minimal_watermark_png(watermark_png)
+    build_animated_outro_clip(outro_mp4, work_dir, duration=OUTRO_DURATION)
+    sub_mov = build_subtitle_overlay_track(kinetic_segments, voice_dur, work_dir)
+
+    # Build continuous 16:9 visual timeline across the entire voiceover duration
+    base_bg_png = os.path.join(work_dir, "base_backdrop_16x9.png")
+    _build_cinematic_backdrop_16x9(seed_clip, work_dir).convert("RGB").save(base_bg_png, "PNG")
+
+    base_mp4 = os.path.join(work_dir, "base_layer_16x9.mp4")
+    base_inputs = ["-loop", "1", "-t", f"{voice_dur:.2f}", "-i", base_bg_png]
+    next_i = 1
+
+    hook_idx = None
+    if os.path.exists(hook_mp4):
+        base_inputs.extend(["-i", hook_mp4])
+        hook_idx = next_i
+        next_i += 1
+
+    clip_indices = []
+    for cp in visual_clips:
+        if os.path.exists(cp):
+            base_inputs.extend(["-stream_loop", "-1", "-t", f"{voice_dur:.2f}", "-i", cp])
+            clip_indices.append(next_i)
+            next_i += 1
+
+    base_filters = [f"[0:v]scale={VIDEO_WIDTH}:{VIDEO_HEIGHT},format=yuv420p[bg0]"]
+    last_v = "bg0"
+
+    # Alternate relevant visuals across the full long video timeline
+    if clip_indices:
+        slot_len = 9.0
+        t_cur = min(HOOK_DURATION, voice_dur) if hook_idx is not None else 0.0
+        slot_idx = 0
+        while t_cur < voice_dur - 0.3:
+            t_end = min(voice_dur, t_cur + slot_len)
+            c_in = clip_indices[slot_idx % len(clip_indices)]
+            out_lbl = f"v_slot_{slot_idx}"
+            base_filters.append(
+                f"[{last_v}][{c_in}:v]overlay=0:0:enable='between(t,{t_cur:.2f},{t_end:.2f})'[{out_lbl}]"
+            )
+            last_v = out_lbl
+            t_cur = t_end
+            slot_idx += 1
+
+    if hook_idx is not None:
+        hook_end = min(HOOK_DURATION, voice_dur)
+        base_filters.append(
+            f"[{last_v}][{hook_idx}:v]overlay=0:0:enable='between(t,0,{hook_end:.2f})'[v_hook]"
+        )
+        last_v = "v_hook"
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-threads", "2", *base_inputs,
+            "-filter_complex", ";".join(base_filters),
+            "-map", f"[{last_v}]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-r", str(FPS), "-t", f"{voice_dur:.2f}", base_mp4,
+        ],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    gc.collect()
+
+    final_inputs = [
+        "-i", base_mp4,
+        "-i", voice_wav,
+        "-loop", "1", "-t", f"{total_duration:.2f}", "-i", watermark_png,
+        "-i", sub_mov,
+        "-i", outro_mp4,
+        "-loop", "1", "-t", f"{COVER_DURATION:.2f}", "-i", thumbnail_jpg,
     ]
-    subprocess.run(concat_cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    bgm_idx = None
+    if os.path.exists(BGM_FILE):
+        final_inputs.extend(["-stream_loop", "-1", "-t", f"{total_duration:.2f}", "-i", BGM_FILE])
+        bgm_idx = 6
+
+    f_parts = [
+        f"[0:v]tpad=stop_mode=clone:stop_duration={OUTRO_DURATION:.2f}[v_base]",
+        f"[v_base][2:v]overlay=36:36:enable='between(t,0,{voice_dur:.2f})'[v_wm]",
+        f"[v_wm][3:v]overlay=(W-w)/2:850:enable='between(t,0,{voice_dur:.2f})'[v_sub]",
+        f"[v_sub]drawbox=x=0:y=0:w='iw*(t/{total_duration:.2f})':h=7:color=#FACC15@0.95:t=fill[v_prog]",
+        f"[v_prog][4:v]overlay=0:0:enable='between(t,{voice_dur:.2f},{total_duration:.2f})'[v_outro]",
+        f"[5:v]scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}[thumb_cover]",
+        f"[v_outro][thumb_cover]overlay=0:0:enable='between(t,0,{COVER_DURATION:.2f})'[v_final]",
+    ]
+
+    if bgm_idx is not None:
+        outro_fade_out_start = max(0.0, OUTRO_DURATION - 0.9)
+        f_parts.extend([
+            f"[{bgm_idx}:a]atrim=0:{voice_dur:.2f},highpass=f=120,lowpass=f=2600,volume={BGM_VOICE_VOLUME},afade=t=in:st=0:d=0.6[bgm_body]",
+            f"[{bgm_idx}:a]atrim={voice_dur:.2f}:{total_duration:.2f},asetpts=PTS-STARTPTS,highpass=f=120,lowpass=f=2800,volume={BGM_OUTRO_VOLUME},afade=t=out:st={outro_fade_out_start:.2f}:d=0.9[bgm_outro]",
+            f"[bgm_body][bgm_outro]concat=n=2:v=0:a=1[bgm_clean]",
+            f"[1:a]apad=pad_dur={OUTRO_DURATION:.2f}[v_pad]",
+            f"[v_pad][bgm_clean]amix=inputs=2:duration=first:weights='1.0 1.0':dropout_transition=2,volume=1.05[a_final]",
+        ])
+    else:
+        f_parts.append(f"[1:a]apad=pad_dur={OUTRO_DURATION:.2f}[a_final]")
+
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-threads", "2", *final_inputs,
+            "-filter_complex", ";".join(f_parts),
+            "-map", "[v_final]", "-map", "[a_final]",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-r", str(FPS),
+            "-t", f"{total_duration:.2f}", output_mp4,
+        ],
+        check=True,
+    )
+    gc.collect()
     return total_duration
 
 
 # ---------------------------------------------------------
-# 6. SHEET QUEUE & PUBLISHING ORCHESTRATOR
+# 8. SHEET QUEUE & PUBLISHING ORCHESTRATOR
 # ---------------------------------------------------------
 def process_scheduled_publishes(spreadsheet, now_dt: datetime):
     for sheet_name, platform_label in [("YouTube Publishing", "YouTube"), ("Facebook Publishing", "Facebook")]:
@@ -611,18 +1366,9 @@ def sync_publish_queues_from_production(spreadsheet, now_dt: datetime):
         spreadsheet,
         "Video Production",
         [
-            "Topic ID",
-            "Video Title",
-            "Production Status",
-            "Video Link",
-            "Duration",
-            "QC Status",
-            "Approval Status",
-            "Notes",
-            "Updated Date",
-            "Release ID",
-            "Video URL",
-            "Cleanup Status",
+            "Topic ID", "Video Title", "Production Status", "Video Link",
+            "Duration", "QC Status", "Approval Status", "Notes",
+            "Updated Date", "Release ID", "Video URL", "Cleanup Status",
         ],
     )
     yt_ws = get_or_create_worksheet(
@@ -702,7 +1448,7 @@ def sync_publish_queues_from_production(spreadsheet, now_dt: datetime):
 
 
 def main():
-    print("Starting Long Video Production Pipeline...")
+    print("Starting 16:9 HomeBDInfo Long Video Production Pipeline...")
     try:
         spreadsheet = get_google_sheet()
         print(f"✅ Successfully connected to Google Sheet: {spreadsheet.title}")
@@ -719,38 +1465,18 @@ def main():
         spreadsheet,
         "Video Script",
         [
-            "Topic ID",
-            "Video Title",
-            "Hook",
-            "Voiceover Script",
-            "Scene Plan",
-            "GitHub Pipeline Note",
-            "YouTube Title",
-            "YouTube Description",
-            "Facebook Caption",
-            "Hashtags",
-            "CTA",
-            "Word Count",
-            "Status",
-            "Created Date",
+            "Topic ID", "Video Title", "Hook", "Voiceover Script", "Scene Plan",
+            "GitHub Pipeline Note", "YouTube Title", "YouTube Description",
+            "Facebook Caption", "Hashtags", "CTA", "Word Count", "Status", "Created Date",
         ],
     )
     prod_ws = get_or_create_worksheet(
         spreadsheet,
         "Video Production",
         [
-            "Topic ID",
-            "Video Title",
-            "Production Status",
-            "Video Link",
-            "Duration",
-            "QC Status",
-            "Approval Status",
-            "Notes",
-            "Updated Date",
-            "Release ID",
-            "Video URL",
-            "Cleanup Status",
+            "Topic ID", "Video Title", "Production Status", "Video Link",
+            "Duration", "QC Status", "Approval Status", "Notes",
+            "Updated Date", "Release ID", "Video URL", "Cleanup Status",
         ],
     )
 
@@ -794,19 +1520,64 @@ def main():
         candidates = [(len(script_rows), script_rows[-1], False)]
 
     generated_count = 0
-    for s_row_num, s_row, is_regen in candidates[:MAX_VIDEOS]:
+    for _, s_row, is_regen in candidates[:MAX_VIDEOS]:
         tid = str(s_row[0]).strip()
         title = str(s_row[smap.get("Video Title", 1)] if len(s_row) > 1 else tid).strip()
+        hook_txt = str(s_row[smap.get("Hook", 2)] if len(s_row) > 2 else "").strip()
         voice_script = str(s_row[smap.get("Voiceover Script", 3)] if len(s_row) > 3 else "").strip()
         scene_plan = str(s_row[smap.get("Scene Plan", 4)] if len(s_row) > 4 else "").strip()
+        keywords = str(s_row[smap.get("Keywords", 9)] if len(s_row) > 9 else "").strip()
 
         if not voice_script:
             voice_script = f"{title} বিষয়ে বিস্তারিত তথ্য ও ব্যবহারিক দিকনির্দেশনা নিচে উপস্থাপন করা হলো।"
 
-        out_mp4 = os.path.join(OUTPUT_DIR, f"{tid}_16x9.mp4")
-        print(f"🎬 Rendering 16:9 video for {tid}: {title}")
-        duration_sec = build_long_video_mp4(tid, title, voice_script, scene_plan, out_mp4)
-        release_info = upload_release_asset(out_mp4, tid)
+        with tempfile.TemporaryDirectory(dir=WORK_DIR_ROOT) as work_dir:
+            thumb_jpg = os.path.join(work_dir, f"thumb_{tid}_16x9.jpg")
+            out_mp4 = os.path.join(OUTPUT_DIR, f"{tid}_16x9.mp4")
+
+            print(f"1. Generating natural voiceover & prosody for {tid}...")
+            voice_wav, kinetic_segments = generate_natural_voiceover(voice_script, work_dir)
+            if hook_txt:
+                kinetic_segments.insert(0, {"text": hook_txt, "start": 0.0, "end": min(HOOK_DURATION, 4.5), "is_hook": True})
+
+            print("2. Building cinematic 16:9 topic cards & relevant stock footage...")
+            scene_lines = [ln.strip() for ln in scene_plan.splitlines() if ln.strip()]
+            chunks_for_cards = [c["text"] for c in split_clauses_for_tts(clean_voiceover_script(voice_script))]
+
+            visual_clips = []
+            for c_idx in range(3):
+                pts = chunks_for_cards[c_idx * 2 : c_idx * 2 + 3] or [voice_script[:120]]
+                head_txt = scene_lines[c_idx] if c_idx < len(scene_lines) else title
+                m_clip = create_dynamic_topic_graphic_clip(head_txt, pts, work_dir, c_idx, duration=10)
+                if m_clip:
+                    visual_clips.append(m_clip)
+
+            stock_clips = download_relevant_stock_clips(keywords, work_dir, max_clips=5)
+            # Interleave stock footage and motion cards for dynamic pacing
+            combined_clips = []
+            max_len = max(len(stock_clips), len(visual_clips))
+            for i in range(max_len):
+                if i < len(stock_clips):
+                    combined_clips.append(stock_clips[i])
+                if i < len(visual_clips):
+                    combined_clips.append(visual_clips[i])
+
+            print("3. Generating 16:9 HomeBDInfo thumbnail...")
+            create_thumbnail_jpg(title, combined_clips, thumb_jpg, work_dir)
+
+            print("4. Rendering full 16:9 long video...")
+            duration_sec = build_final_long_video(
+                title=title,
+                voice_wav=voice_wav,
+                kinetic_segments=kinetic_segments,
+                visual_clips=combined_clips,
+                thumbnail_jpg=thumb_jpg,
+                output_mp4=out_mp4,
+                work_dir=work_dir,
+            )
+
+            print("5. Uploading release & sending Telegram 4-button approval...")
+            release_info = upload_release_asset(out_mp4, thumb_jpg, tid)
 
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         dur_str = f"{int(duration_sec // 60)}m {int(duration_sec % 60)}s"
@@ -821,7 +1592,7 @@ def main():
             dur_str,
             "Passed",
             "Pending Approval",
-            "Regenerated from reversed/updated script." if is_regen else "Generated 16:9 long video; awaiting 4-button Telegram approval.",
+            "Regenerated 16:9 HomeBDInfo long video." if is_regen else "Generated 16:9 HomeBDInfo long video; awaiting approval.",
             stamp,
             release_id,
             asset_url,
@@ -838,7 +1609,7 @@ def main():
         generated_count += 1
 
     sync_publish_queues_from_production(spreadsheet, datetime.now())
-    print(f"🎉 Completed long video run. Generated: {generated_count}")
+    print(f"🎉 Completed 16:9 long video run. Generated: {generated_count}")
 
 
 if __name__ == "__main__":
