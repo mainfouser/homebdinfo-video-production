@@ -13,13 +13,13 @@ from playwright.sync_api import sync_playwright
 # ---------------------------------------------------------
 # 1. ENVIRONMENT & CONFIGURATION
 # ---------------------------------------------------------
-GOOGLE_CREDENTIALS = os.environ.get("GOOGLE_CREDENTIALS") or os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-SHEET_ID = os.environ.get("SHEET_ID") or os.environ.get("SPREADSHEET_ID")
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "").strip()
 TOPIC_ID = os.environ.get("TOPIC_ID", "").strip()
 MAX_VIDEOS = int(os.environ.get("MAX_VIDEOS", "1"))
 VOICE_NAME = os.environ.get("VOICE_NAME", "bn-BD-NabanitaNeural")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -42,14 +42,17 @@ def send_telegram(message):
             print(f"Telegram Notification Error: {e}")
 
 def get_google_sheet():
-    if not GOOGLE_CREDENTIALS or not SHEET_ID:
-        raise RuntimeError("GOOGLE_CREDENTIALS (বা GOOGLE_SERVICE_ACCOUNT_JSON) এবং SHEET_ID (বা SPREADSHEET_ID) সেট করা নেই।")
-    
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds_dict = json.loads(GOOGLE_CREDENTIALS)
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not SPREADSHEET_ID:
+        raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON এবং SPREADSHEET_ID সেট করা নেই।")
+
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    creds_dict = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
-    spreadsheet = client.open_by_key(SHEET_ID)
+    spreadsheet = client.open_by_key(SPREADSHEET_ID)
     return spreadsheet
 
 async def generate_audio(text, output_audio_path, voice=VOICE_NAME):
@@ -69,7 +72,7 @@ def render_html_to_image(html_content, output_image_path, width=1920, height=108
 # ---------------------------------------------------------
 def main():
     print("Starting Long Video Production Pipeline...")
-    
+
     try:
         spreadsheet = get_google_sheet()
         print(f"✅ Successfully connected to Google Sheet: {spreadsheet.title}")
@@ -79,17 +82,12 @@ def main():
         send_telegram(error_msg)
         sys.exit(1)
 
-    # ---------------------------------------------------------
-    # ভিডিও তৈরির মূল লজিক (Script/Sheet Processing & FFmpeg)
-    # ---------------------------------------------------------
-    # উদাহরণস্বরূপ ডামি ভিডিও আউটপুট ফাইল জেনারেট হচ্ছে কি না তা নিশ্চিত করা
-    # প্রসেসিং সম্পন্ন হওয়ার পর আউটপুট ফাইল output/ ডিরেক্টরিতে তৈরি হবে।
-    
+    # আপনার মূল ভিডিও জেনারেশন লজিক এখানে যুক্ত করুন (output/*.mp4 ফাইল তৈরি হবে)
+
     output_files = glob.glob(os.path.join(OUTPUT_DIR, "*.mp4"))
-    
+
     if not output_files:
         print("⚠️ Warning: No MP4 video file was generated in output/ directory!")
-        # যদি শিট থেকে ডাটা পেন্ডিং না থাকে বা প্রসেসিং কমপ্লিট না হয়
         send_telegram("⚠️ <b>Video Generation Notice:</b> প্রসেস সম্পন্ন হয়েছে তবে কোনো নতুন MP4 ফাইল তৈরি হয়নি।")
     else:
         print(f"🎉 Successfully generated {len(output_files)} video(s).")
