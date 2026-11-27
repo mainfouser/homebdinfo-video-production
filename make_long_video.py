@@ -188,6 +188,28 @@ def upload_release_asset(mp4_path: str, thumb_path: str, topic_id: str) -> dict:
         return {"tag": tag_name, "release_id": "", "release_url": "", "asset_url": ""}
 
 
+def _compress_for_telegram_streaming(src_mp4: str, dst_mp4: str, max_mb: float = 48.0):
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-threads", "2", "-i", src_mp4,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
+                "-b:v", "1400k", "-maxrate", "1700k", "-bufsize", "2800k",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                "-c:a", "aac", "-b:a", "128k", "-ar", "44100", "-ac", "2",
+                dst_mp4,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if os.path.exists(dst_mp4) and (os.path.getsize(dst_mp4) / (1024 * 1024)) <= max_mb:
+            return dst_mp4
+    except Exception as exc:
+        print(f"Telegram stream compression warning: {exc}")
+    return src_mp4
+
+
 def send_four_button_approval(
     topic_id: str,
     title: str,
@@ -195,6 +217,7 @@ def send_four_button_approval(
     thumb_path: str,
     release_info: dict,
     duration_sec: float,
+    work_dir: str = "",
 ):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -235,9 +258,16 @@ def send_four_button_approval(
     }
 
     send_video_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+    stream_candidate = mp4_path
 
-    if os.path.exists(mp4_path) and size_mb <= 49.0:
-        files = {"video": open(mp4_path, "rb")}
+    if os.path.exists(mp4_path) and size_mb > 49.0 and work_dir:
+        compact_mp4 = os.path.join(work_dir, f"tg_stream_{topic_id}.mp4")
+        stream_candidate = _compress_for_telegram_streaming(mp4_path, compact_mp4, max_mb=48.5)
+
+    stream_size_mb = os.path.getsize(stream_candidate) / (1024 * 1024) if os.path.exists(stream_candidate) else 999.0
+
+    if os.path.exists(stream_candidate) and stream_size_mb <= 49.5:
+        files = {"video": open(stream_candidate, "rb")}
         if thumb_path and os.path.exists(thumb_path):
             files["thumbnail"] = open(thumb_path, "rb")
         try:
@@ -254,7 +284,7 @@ def send_four_button_approval(
                     "reply_markup": json.dumps(markup),
                 },
                 files=files,
-                timeout=240,
+                timeout=300,
             )
             if res.ok and res.json().get("ok"):
                 print("✅ Sent streaming video player directly to Telegram.")
@@ -292,6 +322,26 @@ def send_four_button_approval(
             print(f"Telegram sendVideo URL warning ({res.status_code}): {res.text[:400]}")
         except Exception as exc:
             print(f"Telegram sendVideo URL error: {exc}")
+
+    if thumb_path and os.path.exists(thumb_path):
+        try:
+            with open(thumb_path, "rb") as ph:
+                p_res = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "caption": caption[:1024],
+                        "parse_mode": "HTML",
+                        "reply_markup": json.dumps(markup),
+                    },
+                    files={"photo": ph},
+                    timeout=90,
+                )
+                if p_res.ok and p_res.json().get("ok"):
+                    print("✅ Sent preview photo + 4 approval buttons to Telegram.")
+                    return
+        except Exception as exc:
+            print(f"Telegram sendPhoto fallback error: {exc}")
 
     send_telegram_message(caption, reply_markup=markup, disable_preview=False)
 
@@ -361,10 +411,36 @@ def _spell_domain_for_tts(domain_str: str) -> str:
     return " ডট ".join(spoken) if spoken else "হোম বিডি ইনফো"
 
 
-def clean_voiceover_script(text: str) -> str:
+def strip_visual_stage_directions(text: str) -> str:
+    """দৃশ্য নির্দেশনা বা ক্যামেরা/সিন নোট স্ক্রিন ও ভয়েস থেকে পরিষ্কারভাবে বাদ দেয়।"""
     t = str(text or "").strip()
+    t = re.sub(r"\[[^\]]*\]|\([^\)]*\)|\{[^\}]*\}", " ", t)
+    cleaned_lines = []
+    for ln in t.splitlines():
+        s = ln.strip()
+        if not s:
+            continue
+        if re.match(
+            r"^(?:দৃশ্য|সিন|ভিডিও\s*দৃশ্য|ক্যামেরা|শট|ভিজ্যুয়াল|গ্রাফিক|ব্যাকগ্রাউন্ড|scene|shot|visual|b-?roll|cut\s*to)\s*[:\-–—]?",
+            s,
+            flags=re.IGNORECASE,
+        ):
+            after = re.sub(
+                r"^(?:দৃশ্য|সিন|ভিডিও\s*দৃশ্য|ক্যামেরা|শট|ভিজ্যুয়াল|গ্রাফিক|ব্যাকগ্রাউন্ড|scene|shot|visual|b-?roll|cut\s*to)\s*[:\-–—]?\s*\d*\s*[:\-–—]?\s*",
+                "",
+                s,
+                flags=re.IGNORECASE,
+            ).strip()
+            if not after or len(after.split()) <= 5:
+                continue
+            s = after
+        cleaned_lines.append(s)
+    return " ".join(cleaned_lines).strip()
+
+
+def clean_voiceover_script(text: str) -> str:
+    t = strip_visual_stage_directions(text)
     t = re.sub(r"```[\s\S]*?```", " ", t)
-    t = re.sub(r"\[[^\]]*\]|\{[^\}]*\}", " ", t)
     t = re.sub(
         r"হোম\s*বিডি\s*ইনফো\s*(?:ডট\s*কম)?\s*\(?homebdinfo\.com\)?",
         "হোম বিডি ইনফো",
@@ -765,7 +841,7 @@ def _build_cinematic_backdrop_16x9(seed_clip: Optional[str], work_dir: str) -> I
 
 
 def create_minimal_watermark_png(out_path: str):
-    w, h = 420, 74
+    w, h = 290, 74
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
     draw.rounded_rectangle(
@@ -775,7 +851,7 @@ def create_minimal_watermark_png(out_path: str):
         outline=(250, 204, 21, 210),
         width=2,
     )
-    text_x = 22
+    text_x = 24
     if os.path.exists(LOGO_FILE):
         try:
             logo = Image.open(LOGO_FILE).convert("RGBA")
@@ -789,7 +865,7 @@ def create_minimal_watermark_png(out_path: str):
             pass
     bn_font = find_font(BENGALI_FONT_PATHS, 26)
     en_font = find_font(LATIN_FONT_PATHS, 26)
-    render_mixed_text_line(draw, text_x, 20, "HomeBDInfo • বিশেষ ডেস্ক", bn_font, en_font, fill=(255, 255, 255, 252))
+    render_mixed_text_line(draw, text_x, 20, "HomeBDInfo", bn_font, en_font, fill=(255, 255, 255, 252))
     img.save(out_path, "PNG")
 
 
@@ -799,13 +875,18 @@ def create_clean_subtitle_png(text: str, is_hook: bool, out_path: str):
     img = Image.new("RGBA", (canvas_w, canvas_h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
 
+    clean_sub = strip_visual_stage_directions(text)
+    if not clean_sub:
+        img.save(out_path, "PNG")
+        return
+
     font_size = 42 if is_hook else 36
-    if len(text) > 54:
+    if len(clean_sub) > 54:
         font_size = 32
 
     bn_font = find_font(BENGALI_FONT_PATHS, font_size)
     en_font = find_font(LATIN_FONT_PATHS, font_size - 2)
-    lines = wrap_text_by_pixel(draw, text, bn_font, en_font, 1580)[:2]
+    lines = wrap_text_by_pixel(draw, clean_sub, bn_font, en_font, 1580)[:2]
 
     line_h = font_size + 14
     total_h = len(lines) * line_h
@@ -863,12 +944,12 @@ def create_hook_banner_clip(
     bw = measure_mixed_text_width(draw, b_txt, bn_b, en_b)
     render_mixed_text_line(draw, (VIDEO_WIDTH - bw) // 2, by0 + 12, b_txt, bn_b, en_b, fill=(7, 18, 30, 255))
 
-    clean_title = re.sub(r"#\w+|https?://\S+", "", title).strip()
+    clean_title = re.sub(r"#\w+|https?://\S+", "", strip_visual_stage_directions(title)).strip()
     bn_t = find_font(BENGALI_FONT_PATHS, 56)
     en_t = find_font(LATIN_FONT_PATHS, 52)
     t_lines = wrap_text_by_pixel(draw, clean_title, bn_t, en_t, VIDEO_WIDTH - 320)[:2]
 
-    clean_hook = re.sub(r"[•✔*#]+|https?://\S+", "", hook_line).strip()
+    clean_hook = re.sub(r"[•✔*#]+|https?://\S+", "", strip_visual_stage_directions(hook_line)).strip()
     bn_h = find_font(BENGALI_FONT_PATHS, 36)
     en_h = find_font(LATIN_FONT_PATHS, 34)
     h_lines = wrap_text_by_pixel(draw, clean_hook, bn_h, en_h, VIDEO_WIDTH - 340)[:2]
@@ -917,7 +998,7 @@ def create_hook_banner_clip(
                 f"zoompan=z='1+0.025*(on/{max(1, n_frames)})':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2'"
                 f":d={n_frames}:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
             ),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
             "-t", f"{duration:.2f}", out_mp4,
         ],
         check=True,
@@ -962,7 +1043,7 @@ def create_thumbnail_jpg(
     pw = measure_mixed_text_width(draw, p_txt, bn_p, en_p)
     render_mixed_text_line(draw, px0 + (pill_w - pw) // 2, py0 + 11, p_txt, bn_p, en_p, fill=(7, 18, 30, 255))
 
-    clean_title = re.sub(r"#\w+|https?://\S+", "", title).strip()
+    clean_title = re.sub(r"#\w+|https?://\S+", "", strip_visual_stage_directions(title)).strip()
     bn_t = find_font(BENGALI_FONT_PATHS, 66)
     en_t = find_font(LATIN_FONT_PATHS, 60)
     lines = wrap_text_by_pixel(draw, clean_title, bn_t, en_t, VIDEO_WIDTH - 240)[:3]
@@ -1094,7 +1175,7 @@ def build_animated_outro_clip(out_mp4: str, work_dir: str, duration: float = OUT
             "ffmpeg", "-y", "-threads", "2",
             "-framerate", str(FPS),
             "-i", os.path.join(frames_dir, "outro_%04d.png"),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-pix_fmt", "yuv420p", "-t", f"{duration:.2f}", out_mp4,
         ],
         check=True,
@@ -1125,7 +1206,7 @@ def _encode_lightweight_motion_clip_16x9(image_path: str, out_mp4: str, duration
                 f"zoompan=z='{zoom_expr}':x='iw/2-(iw/zoom)/2':y='ih/2-(ih/zoom)/2'"
                 f":d={n_frames}:s={VIDEO_WIDTH}x{VIDEO_HEIGHT}:fps={FPS}"
             ),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
             "-t", str(duration), out_mp4,
         ],
         check=True,
@@ -1168,7 +1249,7 @@ def create_dynamic_topic_graphic_clip(
             width=3,
         )
 
-        clean_head = re.sub(r"#\w+|https?://\S+", "", headline).strip()
+        clean_head = re.sub(r"#\w+|https?://\S+", "", strip_visual_stage_directions(headline)).strip()
         bn_h = find_font(BENGALI_FONT_PATHS, 46)
         en_h = find_font(LATIN_FONT_PATHS, 42)
         h_lines = wrap_text_by_pixel(draw, clean_head, bn_h, en_h, card_x1 - card_x0 - 120)[:2]
@@ -1184,7 +1265,11 @@ def create_dynamic_topic_graphic_clip(
 
         bn_pt = find_font(BENGALI_FONT_PATHS, 34)
         en_pt = find_font(LATIN_FONT_PATHS, 32)
-        valid_pts = [re.sub(r"https?://\S+", "", p).strip() for p in bullet_points if len(p.strip()) > 6][:3]
+        valid_pts = [
+            re.sub(r"https?://\S+", "", strip_visual_stage_directions(p)).strip()
+            for p in bullet_points
+            if len(strip_visual_stage_directions(p).strip()) > 6
+        ][:3]
         for pt in valid_pts:
             if cur_y > card_y1 - 85:
                 break
@@ -1261,7 +1346,7 @@ def download_relevant_stock_clips(keywords: str, work_dir: str, max_clips: int =
                                 f"crop={VIDEO_WIDTH}:{VIDEO_HEIGHT},"
                                 f"eq=brightness=-0.08:contrast=1.08:saturation=1.05"
                             ),
-                            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-r", str(FPS),
+                            "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-r", str(FPS),
                             "-t", "10", norm_p,
                         ],
                         check=True,
@@ -1315,7 +1400,7 @@ def build_subtitle_overlay_track(kinetic_segments: List[Dict], voice_dur: float,
         en = min(safe_voice_dur, float(seg.get("end", st)))
         if st >= safe_voice_dur or en <= st + 0.02:
             continue
-        txt = str(seg.get("text", "")).strip()
+        txt = strip_visual_stage_directions(str(seg.get("text", "")))
         if not txt:
             continue
         kp = os.path.join(sub_dir, f"sub_{idx}.png")
@@ -1358,7 +1443,7 @@ def build_subtitle_overlay_track(kinetic_segments: List[Dict], voice_dur: float,
             [
                 "ffmpeg", "-y", "-threads", "2",
                 "-f", "concat", "-safe", "0", "-i", concat_file,
-                "-vf", f"fps=15,format=rgba",
+                "-vf", "fps=15,format=rgba",
                 "-c:v", "png", "-pix_fmt", "rgba",
                 "-t", f"{safe_voice_dur:.3f}", sub_mov,
             ],
@@ -1456,7 +1541,7 @@ def build_final_long_video(
             "ffmpeg", "-y", "-threads", "2", *base_inputs,
             "-filter_complex", ";".join(base_filters),
             "-map", f"[{last_v}]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
             "-r", str(FPS), "-t", f"{voice_dur:.2f}", base_mp4,
         ],
         check=True,
@@ -1505,9 +1590,10 @@ def build_final_long_video(
             "ffmpeg", "-y", "-threads", "2", *final_inputs,
             "-filter_complex", ";".join(f_parts),
             "-map", "[v_final]", "-map", "[a_final]",
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
-            "-movflags", "+faststart",
-            "-c:a", "aac", "-b:a", "192k", "-r", str(FPS),
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
+            "-b:v", "1800k", "-maxrate", "2200k", "-bufsize", "3600k",
+            "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+            "-c:a", "aac", "-b:a", "128k", "-r", str(FPS),
             "-t", f"{total_duration:.2f}", output_mp4,
         ],
         check=True,
@@ -1724,11 +1810,11 @@ def main():
         title = str(s_row[smap.get("Video Title", 1)] if len(s_row) > 1 else tid).strip()
         hook_txt = str(s_row[smap.get("Hook", 2)] if len(s_row) > 2 else "").strip()
         voice_script = str(s_row[smap.get("Voiceover Script", 3)] if len(s_row) > 3 else "").strip()
-        scene_plan = str(s_row[smap.get("Scene Plan", 4)] if len(s_row) > 4 else "").strip()
         keywords = str(s_row[smap.get("Keywords", 9)] if len(s_row) > 9 else "").strip()
 
+        clean_title_for_vo = strip_visual_stage_directions(title) or title
         if not voice_script:
-            voice_script = f"{title} বিষয়ে বিস্তারিত তথ্য ও ব্যবহারিক দিকনির্দেশনা নিচে উপস্থাপন করা হলো।"
+            voice_script = f"{clean_title_for_vo} বিষয়ে বিস্তারিত তথ্য ও ব্যবহারিক দিকনির্দেশনা নিচে উপস্থাপন করা হলো।"
 
         with tempfile.TemporaryDirectory(dir=WORK_DIR_ROOT) as work_dir:
             thumb_jpg = os.path.join(work_dir, f"thumb_{tid}_16x9.jpg")
@@ -1736,17 +1822,17 @@ def main():
 
             print(f"1. Generating natural voiceover & prosody for {tid}...")
             voice_wav, kinetic_segments = generate_natural_voiceover(voice_script, work_dir)
-            if hook_txt:
-                kinetic_segments.insert(0, {"text": hook_txt, "start": 0.0, "end": min(HOOK_DURATION, 4.5), "is_hook": True})
+            clean_hook_vo = strip_visual_stage_directions(hook_txt)
+            if clean_hook_vo:
+                kinetic_segments.insert(0, {"text": clean_hook_vo, "start": 0.0, "end": min(HOOK_DURATION, 4.5), "is_hook": True})
 
             print("2. Building cinematic 16:9 topic cards & relevant stock footage...")
-            scene_lines = [ln.strip() for ln in scene_plan.splitlines() if ln.strip()]
             chunks_for_cards = [c["text"] for c in split_clauses_for_tts(clean_voiceover_script(voice_script))]
 
             visual_clips = []
             for c_idx in range(3):
-                pts = chunks_for_cards[c_idx * 2 : c_idx * 2 + 3] or [voice_script[:120]]
-                head_txt = scene_lines[c_idx] if c_idx < len(scene_lines) else title
+                pts = chunks_for_cards[c_idx * 2 : c_idx * 2 + 3] or [clean_voiceover_script(voice_script)[:120]]
+                head_txt = clean_title_for_vo
                 m_clip = create_dynamic_topic_graphic_clip(head_txt, pts, work_dir, c_idx, duration=10)
                 if m_clip:
                     visual_clips.append(m_clip)
@@ -1776,7 +1862,7 @@ def main():
 
             print("5. Uploading release & sending Telegram streaming player + 4 buttons...")
             release_info = upload_release_asset(out_mp4, thumb_jpg, tid)
-            send_four_button_approval(tid, title, out_mp4, thumb_jpg, release_info, duration_sec)
+            send_four_button_approval(tid, title, out_mp4, thumb_jpg, release_info, duration_sec, work_dir=work_dir)
 
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         dur_str = f"{int(duration_sec // 60)}m {int(duration_sec % 60)}s"
