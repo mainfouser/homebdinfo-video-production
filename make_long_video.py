@@ -380,7 +380,7 @@ def clean_voiceover_script(text: str) -> str:
         t,
     )
     t = re.sub(
-        r"(?:[a-z0-9-]+\.)+(?:gov\.bd|com\.bd|org\.bd|edu\.bd|bd|com|org|net|info)",
+        r" (?:[a-z0-9-]+\.)+(?:gov\.bd|com\.bd|org\.bd|edu\.bd|bd|com|org|net|info) ",
         lambda m: _spell_domain_for_tts(m.group(0)),
         t,
         flags=re.IGNORECASE,
@@ -1281,49 +1281,95 @@ def download_relevant_stock_clips(keywords: str, work_dir: str, max_clips: int =
 # ---------------------------------------------------------
 # 7. SUBTITLE OVERLAY & FINAL 16:9 LONG VIDEO ASSEMBLY
 # ---------------------------------------------------------
-def build_subtitle_overlay_track(kinetic_segments: List[Dict], voice_dur: float, work_dir: str) -> str:
-    sub_dir = os.path.join(work_dir, "sub_frames_16x9")
-    os.makedirs(sub_dir, exist_ok=True)
-    blank_png = os.path.join(sub_dir, "blank.png")
-    Image.new("RGBA", (1760, 190), (0, 0, 0, 0)).save(blank_png, "PNG")
+def _escape_concat_path(path_str: str) -> str:
+    abs_p = os.path.abspath(path_str).replace("\\", "/")
+    return abs_p.replace("'", "'\\''")
 
-    seg_pngs = []
-    for idx, seg in enumerate(kinetic_segments):
-        kp = os.path.join(sub_dir, f"sub_{idx}.png")
-        create_clean_subtitle_png(seg["text"], seg["is_hook"], kp)
-        seg_pngs.append((kp, seg["start"], min(seg["end"], voice_dur)))
 
-    concat_file = os.path.join(sub_dir, "sub_concat.txt")
-    cursor = 0.0
-    entries = []
-    for kp, st, en in seg_pngs:
-        if st >= voice_dur or en <= st:
-            continue
-        if st > cursor + 0.02:
-            entries.append((blank_png, st - cursor))
-        entries.append((kp, en - st))
-        cursor = en
-    if cursor < voice_dur:
-        entries.append((blank_png, voice_dur - cursor))
-    if not entries:
-        entries.append((blank_png, voice_dur))
-
-    with open(concat_file, "w", encoding="utf-8") as f:
-        for img_path, dur in entries:
-            f.write(f"file '{img_path}'\n")
-            f.write(f"duration {dur:.3f}\n")
-        f.write(f"file '{entries[-1][0]}'\n")
-
-    sub_mov = os.path.join(work_dir, "kinetic_track_16x9.mov")
+def _create_blank_subtitle_mov(out_mov: str, duration: float):
+    safe_dur = max(0.5, float(duration))
     subprocess.run(
         [
-            "ffmpeg", "-y", "-threads", "2", "-f", "concat", "-safe", "0", "-i", concat_file,
-            "-vf", "fps=15", "-c:v", "png", sub_mov,
+            "ffmpeg", "-y", "-threads", "2",
+            "-f", "lavfi",
+            "-i", f"color=c=black@0.0:s=1760x190:r=15:d={safe_dur:.3f}",
+            "-c:v", "png", "-pix_fmt", "rgba", out_mov,
         ],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+
+
+def build_subtitle_overlay_track(kinetic_segments: List[Dict], voice_dur: float, work_dir: str) -> str:
+    sub_dir = os.path.join(work_dir, "sub_frames_16x9")
+    os.makedirs(sub_dir, exist_ok=True)
+    safe_voice_dur = max(0.5, float(voice_dur))
+
+    blank_png = os.path.join(sub_dir, "blank.png")
+    Image.new("RGBA", (1760, 190), (0, 0, 0, 0)).save(blank_png, "PNG")
+
+    seg_pngs = []
+    for idx, seg in enumerate(kinetic_segments):
+        st = max(0.0, float(seg.get("start", 0.0)))
+        en = min(safe_voice_dur, float(seg.get("end", st)))
+        if st >= safe_voice_dur or en <= st + 0.02:
+            continue
+        txt = str(seg.get("text", "")).strip()
+        if not txt:
+            continue
+        kp = os.path.join(sub_dir, f"sub_{idx}.png")
+        try:
+            create_clean_subtitle_png(txt, bool(seg.get("is_hook", False)), kp)
+            if os.path.exists(kp) and os.path.getsize(kp) > 0:
+                seg_pngs.append((kp, st, en))
+        except Exception as exc:
+            print(f"Warning: subtitle frame {idx} skipped: {exc}")
+
+    entries = []
+    cursor = 0.0
+    for kp, st, en in sorted(seg_pngs, key=lambda x: x[1]):
+        if st < cursor:
+            st = cursor
+        if en <= st + 0.02:
+            continue
+        if st - cursor >= 0.02:
+            entries.append((blank_png, round(st - cursor, 3)))
+        entries.append((kp, round(en - st, 3)))
+        cursor = en
+
+    if safe_voice_dur - cursor >= 0.02:
+        entries.append((blank_png, round(safe_voice_dur - cursor, 3)))
+
+    valid_entries = [(p, d) for p, d in entries if p and os.path.exists(p) and d >= 0.02]
+    if not valid_entries:
+        valid_entries = [(blank_png, round(safe_voice_dur, 3))]
+
+    concat_file = os.path.join(sub_dir, "sub_concat.txt")
+    with open(concat_file, "w", encoding="utf-8") as f:
+        for img_path, dur in valid_entries:
+            f.write(f"file '{_escape_concat_path(img_path)}'\n")
+            f.write(f"duration {dur:.3f}\n")
+        f.write(f"file '{_escape_concat_path(valid_entries[-1][0])}'\n")
+
+    sub_mov = os.path.join(work_dir, "kinetic_track_16x9.mov")
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-threads", "2",
+                "-f", "concat", "-safe", "0", "-i", concat_file,
+                "-vf", f"fps=15,format=rgba",
+                "-c:v", "png", "-pix_fmt", "rgba",
+                "-t", f"{safe_voice_dur:.3f}", sub_mov,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"Warning: concat subtitle track fallback ({exc.returncode}), generating clean overlay...")
+        _create_blank_subtitle_mov(sub_mov, safe_voice_dur)
+
     gc.collect()
     return sub_mov
 
