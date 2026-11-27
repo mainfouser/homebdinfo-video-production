@@ -80,7 +80,7 @@ def find_font(paths: List[str], size: int) -> ImageFont.FreeTypeFont:
 
 
 # ---------------------------------------------------------
-# 2. TELEGRAM & GITHUB RELEASE HELPERS
+# 2. TELEGRAM STREAMING PLAYER & GITHUB RELEASE HELPERS
 # ---------------------------------------------------------
 def tg_escape(text: str) -> str:
     return (
@@ -188,7 +188,17 @@ def upload_release_asset(mp4_path: str, thumb_path: str, topic_id: str) -> dict:
         return {"tag": tag_name, "release_id": "", "release_url": "", "asset_url": ""}
 
 
-def send_four_button_approval(topic_id: str, title: str, mp4_path: str, release_info: dict, duration_sec: float):
+def send_four_button_approval(
+    topic_id: str,
+    title: str,
+    mp4_path: str,
+    thumb_path: str,
+    release_info: dict,
+    duration_sec: float,
+):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
     size_mb = os.path.getsize(mp4_path) / (1024 * 1024) if os.path.exists(mp4_path) else 0.0
     mins = int(duration_sec // 60)
     secs = int(duration_sec % 60)
@@ -196,7 +206,7 @@ def send_four_button_approval(topic_id: str, title: str, mp4_path: str, release_
     asset_url = release_info.get("asset_url", "")
     release_url = release_info.get("release_url", "")
 
-    lines = [
+    caption_lines = [
         "🎬 <b>নতুন ১৬:৯ লং ভিডিও তৈরি হয়েছে • HomeBDInfo</b>",
         "",
         f"📌 <b>Topic ID:</b> <code>{tg_escape(topic_id)}</code>",
@@ -204,11 +214,12 @@ def send_four_button_approval(topic_id: str, title: str, mp4_path: str, release_
         f"⏱ <b>Duration:</b> {mins}m {secs}s | <b>Size:</b> {size_mb:.1f} MB",
     ]
     if asset_url:
-        lines.append(f"▶️ <b>Video File:</b> <a href='{tg_escape(asset_url)}'>Watch / Download MP4</a>")
+        caption_lines.append(f"📦 <b>GitHub MP4:</b> <a href='{tg_escape(asset_url)}'>Download / Direct File</a>")
     if release_url:
-        lines.append(f"📦 <b>Release:</b> <a href='{tg_escape(release_url)}'>Open Release</a>")
-    lines.append("")
-    lines.append("নিচের ৪টি বাটন থেকে একটি নির্বাচন করুন:")
+        caption_lines.append(f"🏷 <b>Release:</b> <a href='{tg_escape(release_url)}'>Open GitHub Release</a>")
+    caption_lines.append("")
+    caption_lines.append("▶️ ডাউনলোড ছাড়াই টেলিগ্রাম প্লেয়ারে ভিডিওটি প্লে করে দেখুন এবং নিচের ৪টি বাটন থেকে একটি বেছে নিন:")
+    caption = "\n".join(caption_lines)
 
     markup = {
         "inline_keyboard": [
@@ -222,7 +233,70 @@ def send_four_button_approval(topic_id: str, title: str, mp4_path: str, release_
             ],
         ]
     }
-    send_telegram_message("\n".join(lines), reply_markup=markup, disable_preview=False)
+
+    send_video_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+
+    # 1) Try direct streaming video upload to Telegram player (up to ~49 MB for standard Bot API)
+    if os.path.exists(mp4_path) and size_mb <= 49.0:
+        files = {"video": open(mp4_path, "rb")}
+        if thumb_path and os.path.exists(thumb_path):
+            files["thumbnail"] = open(thumb_path, "rb")
+        try:
+            res = requests.post(
+                send_video_url,
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": caption[:1024],
+                    "parse_mode": "HTML",
+                    "width": str(VIDEO_WIDTH),
+                    "height": str(VIDEO_HEIGHT),
+                    "duration": str(int(round(duration_sec))),
+                    "supports_streaming": "true",
+                    "reply_markup": json.dumps(markup),
+                },
+                files=files,
+                timeout=240,
+            )
+            if res.ok and res.json().get("ok"):
+                print("✅ Sent streaming video player directly to Telegram.")
+                return
+            print(f"Telegram sendVideo file warning ({res.status_code}): {res.text[:400]}")
+        except Exception as exc:
+            print(f"Telegram sendVideo file upload error: {exc}")
+        finally:
+            for f_obj in files.values():
+                try:
+                    f_obj.close()
+                except Exception:
+                    pass
+
+    # 2) Fallback: if video is larger than 49 MB, try passing the public GitHub release asset URL to sendVideo
+    if asset_url:
+        try:
+            res = requests.post(
+                send_video_url,
+                json={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "video": asset_url,
+                    "caption": caption[:1024],
+                    "parse_mode": "HTML",
+                    "width": VIDEO_WIDTH,
+                    "height": VIDEO_HEIGHT,
+                    "duration": int(round(duration_sec)),
+                    "supports_streaming": True,
+                    "reply_markup": markup,
+                },
+                timeout=120,
+            )
+            if res.ok and res.json().get("ok"):
+                print("✅ Sent streaming video via GitHub release URL to Telegram.")
+                return
+            print(f"Telegram sendVideo URL warning ({res.status_code}): {res.text[:400]}")
+        except Exception as exc:
+            print(f"Telegram sendVideo URL error: {exc}")
+
+    # 3) Final fallback: send message with links & 4 buttons
+    send_telegram_message(caption, reply_markup=markup, disable_preview=False)
 
 
 # ---------------------------------------------------------
@@ -402,6 +476,32 @@ def split_kinetic_chunks(sentence: str, max_chars: int = 52) -> List[str]:
     return chunks
 
 
+def _ensure_valid_pcm_wav(src_wav: str, dst_wav: str, min_dur: float = 0.15):
+    try:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-threads", "2", "-i", src_wav,
+                "-af", f"apad=pad_dur={min_dur:.2f}",
+                "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", dst_wav,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-threads", "2",
+                "-f", "lavfi", "-i", f"anullsrc=r=44100:cl=stereo",
+                "-t", f"{min_dur:.2f}",
+                "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", dst_wav,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+
 def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Dict]]:
     cleaned = clean_voiceover_script(script)
     clauses = split_clauses_for_tts(cleaned)
@@ -415,18 +515,36 @@ def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Di
         rate, pitch, end_pause = get_tv_presenter_prosody(c_info)
 
         raw_mp3 = os.path.join(work_dir, f"tts_{idx}.mp3")
+        raw_wav = os.path.join(work_dir, f"tts_raw_{idx}.wav")
         wav_seg = os.path.join(work_dir, f"tts_{idx}.wav")
 
-        asyncio.run(_synthesize_phrase(clause_text, raw_mp3, rate, pitch, voice=VOICE_NAME))
+        tts_ok = False
+        try:
+            asyncio.run(_synthesize_phrase(clause_text, raw_mp3, rate, pitch, voice=VOICE_NAME))
+            if os.path.exists(raw_mp3) and os.path.getsize(raw_mp3) > 100:
+                subprocess.run(
+                    [
+                        "ffmpeg", "-y", "-threads", "2", "-i", raw_mp3,
+                        "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", raw_wav,
+                    ],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                _ensure_valid_pcm_wav(raw_wav, wav_seg, min_dur=0.20)
+                tts_ok = os.path.exists(wav_seg) and os.path.getsize(wav_seg) > 44
+        except Exception as exc:
+            print(f"Warning: TTS segment {idx} fallback to silence: {exc}")
 
-        subprocess.run(
-            ["ffmpeg", "-y", "-threads", "2", "-i", raw_mp3, "-ar", "44100", "-ac", "2", wav_seg],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        if os.path.exists(raw_mp3):
-            os.remove(raw_mp3)
+        for tmp_f in (raw_mp3, raw_wav):
+            if os.path.exists(tmp_f):
+                try:
+                    os.remove(tmp_f)
+                except Exception:
+                    pass
+
+        if not tts_ok:
+            _ensure_valid_pcm_wav("", wav_seg, min_dur=0.80)
 
         probe = subprocess.run(
             [
@@ -437,7 +555,11 @@ def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Di
             text=True,
             check=True,
         )
-        dur = float(probe.stdout.strip())
+        try:
+            dur = max(0.20, float(probe.stdout.strip()))
+        except Exception:
+            dur = 0.50
+
         segment_files.append(wav_seg)
 
         clause_start = current_time
@@ -463,25 +585,41 @@ def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Di
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-threads", "2", "-f", "lavfi",
-                    "-i", "anullsrc=r=44100:cl=stereo", "-t", f"{end_pause:.2f}", sil_wav,
+                    "-i", "anullsrc=r=44100:cl=stereo", "-t", f"{end_pause:.2f}",
+                    "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", sil_wav,
                 ],
                 check=True,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            segment_files.append(sil_wav)
-            current_time += end_pause
+            if os.path.exists(sil_wav) and os.path.getsize(sil_wav) > 44:
+                segment_files.append(sil_wav)
+                current_time += end_pause
 
-    concat_list = os.path.join(work_dir, "audio_concat.txt")
-    with open(concat_list, "w", encoding="utf-8") as f:
-        for sf in segment_files:
-            f.write(f"file '{sf}'\n")
+    if not segment_files:
+        fallback_wav = os.path.join(work_dir, "fallback_voice.wav")
+        _ensure_valid_pcm_wav("", fallback_wav, min_dur=3.0)
+        segment_files.append(fallback_wav)
 
     raw_concat_wav = os.path.join(work_dir, "voiceover_raw.wav")
     final_voice_wav = os.path.join(work_dir, "voiceover_full.wav")
 
+    # Decode and re-encode PCM streams cleanly instead of raw stream copy (-c copy) to avoid exit code 254
+    filter_inputs = []
+    filter_pads = []
+    for i, sf in enumerate(segment_files):
+        filter_inputs.extend(["-i", sf])
+        filter_pads.append(f"[{i}:a]aformat=sample_fmts=s16:sample_rates=44100:channel_layouts=stereo[a{i}]")
+
+    concat_filter = "".join(filter_pads) + f"{''.join(f'[a{i}]' for i in range(len(segment_files)))}concat=n={len(segment_files)}:v=0:a=1[aout]"
+
     subprocess.run(
-        ["ffmpeg", "-y", "-threads", "2", "-f", "concat", "-safe", "0", "-i", concat_list, "-c", "copy", raw_concat_wav],
+        [
+            "ffmpeg", "-y", "-threads", "2", *filter_inputs,
+            "-filter_complex", concat_filter,
+            "-map", "[aout]",
+            "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", raw_concat_wav,
+        ],
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -497,7 +635,7 @@ def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Di
                 "acompressor=threshold=-17dB:ratio=2.6:attack=6:release=110,"
                 "loudnorm=I=-15.0:TP=-1.5:LRA=10"
             ),
-            "-ar", "44100", "-ac", "2", final_voice_wav,
+            "-acodec", "pcm_s16le", "-ar", "44100", "-ac", "2", final_voice_wav,
         ],
         check=True,
         stdout=subprocess.DEVNULL,
@@ -506,9 +644,15 @@ def generate_natural_voiceover(script: str, work_dir: str) -> Tuple[str, List[Di
 
     for sf in segment_files:
         if os.path.exists(sf):
-            os.remove(sf)
+            try:
+                os.remove(sf)
+            except Exception:
+                pass
     if os.path.exists(raw_concat_wav):
-        os.remove(raw_concat_wav)
+        try:
+            os.remove(raw_concat_wav)
+        except Exception:
+            pass
 
     return final_voice_wav, kinetic_segments
 
@@ -1206,7 +1350,6 @@ def build_final_long_video(
     build_animated_outro_clip(outro_mp4, work_dir, duration=OUTRO_DURATION)
     sub_mov = build_subtitle_overlay_track(kinetic_segments, voice_dur, work_dir)
 
-    # Build continuous 16:9 visual timeline across the entire voiceover duration
     base_bg_png = os.path.join(work_dir, "base_backdrop_16x9.png")
     _build_cinematic_backdrop_16x9(seed_clip, work_dir).convert("RGB").save(base_bg_png, "PNG")
 
@@ -1230,7 +1373,6 @@ def build_final_long_video(
     base_filters = [f"[0:v]scale={VIDEO_WIDTH}:{VIDEO_HEIGHT},format=yuv420p[bg0]"]
     last_v = "bg0"
 
-    # Alternate relevant visuals across the full long video timeline
     if clip_indices:
         slot_len = 9.0
         t_cur = min(HOOK_DURATION, voice_dur) if hook_idx is not None else 0.0
@@ -1308,6 +1450,7 @@ def build_final_long_video(
             "-filter_complex", ";".join(f_parts),
             "-map", "[v_final]", "-map", "[a_final]",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
             "-c:a", "aac", "-b:a", "192k", "-r", str(FPS),
             "-t", f"{total_duration:.2f}", output_mp4,
         ],
@@ -1553,7 +1696,6 @@ def main():
                     visual_clips.append(m_clip)
 
             stock_clips = download_relevant_stock_clips(keywords, work_dir, max_clips=5)
-            # Interleave stock footage and motion cards for dynamic pacing
             combined_clips = []
             max_len = max(len(stock_clips), len(visual_clips))
             for i in range(max_len):
@@ -1576,8 +1718,9 @@ def main():
                 work_dir=work_dir,
             )
 
-            print("5. Uploading release & sending Telegram 4-button approval...")
+            print("5. Uploading release & sending Telegram streaming player + 4 buttons...")
             release_info = upload_release_asset(out_mp4, thumb_jpg, tid)
+            send_four_button_approval(tid, title, out_mp4, thumb_jpg, release_info, duration_sec)
 
         stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         dur_str = f"{int(duration_sec // 60)}m {int(duration_sec % 60)}s"
@@ -1605,7 +1748,6 @@ def main():
         else:
             prod_ws.append_row(new_prod_row)
 
-        send_four_button_approval(tid, title, out_mp4, release_info, duration_sec)
         generated_count += 1
 
     sync_publish_queues_from_production(spreadsheet, datetime.now())
