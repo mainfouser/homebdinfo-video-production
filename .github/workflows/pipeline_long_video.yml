@@ -51,6 +51,7 @@ jobs:
           VOICE_NAME: ${{ vars.VOICE_NAME || 'bn-BD-NabanitaNeural' }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          SCRIPT_EDITOR_WEBAPP_URL: ${{ vars.SCRIPT_EDITOR_WEBAPP_URL }}
         run: |
           mkdir -p output
           python make_long_video.py
